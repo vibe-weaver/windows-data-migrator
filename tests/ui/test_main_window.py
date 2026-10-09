@@ -69,7 +69,7 @@ def test_wizard_walks_all_four_pages(qtbot, tmp_path):
     window.go_next()
     qtbot.waitUntil(lambda: window.current_index() == PAGE_PLAN, timeout=5000)
     qtbot.waitUntil(lambda: not window.is_busy(), timeout=5000)
-    assert window.plan_page.metric("files") == "2"
+    assert window.plan_page.metric_text("files") == "2"
 
     window.go_next()
     qtbot.waitUntil(lambda: window.current_index() == PAGE_PROGRESS, timeout=5000)

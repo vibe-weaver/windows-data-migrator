@@ -38,13 +38,13 @@ def page(qtbot):
 
 def test_metrics_are_rendered(page):
     page.load(_plan())
-    assert page.metric("bytes") == "2.0 KB"
-    assert page.metric("files") == "8"
-    assert page.metric("dirs") == "3"
-    assert page.metric("links") == "1"
-    assert page.metric("elevation") == "0"
-    assert page.metric("locks") == LOCK_HINT
-    assert page.metric("eta") != "-"
+    assert page.metric_text("bytes") == "2.0 KB"
+    assert page.metric_text("files") == "8"
+    assert page.metric_text("dirs") == "3"
+    assert page.metric_text("links") == "1"
+    assert page.metric_text("elevation") == "0"
+    assert page.metric_text("locks") == LOCK_HINT
+    assert page.metric_text("eta") != "-"
 
 
 def test_group_table_is_rendered(page):
@@ -99,7 +99,7 @@ def test_elevate_button_follows_permission_issues(page):
     assert page.elevate_button.isEnabled() is False
     page.load(_plan(permission_issues=[str(Path(r"D:\myapp\data\locked"))]))
     assert page.elevate_button.isEnabled() is True
-    assert page.metric("elevation") == "1"
+    assert page.metric_text("elevation") == "1"
     assert "以管理员身份重试" in page.warning_text()
 
 

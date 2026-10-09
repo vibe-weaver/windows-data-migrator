@@ -9,8 +9,8 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QCheckBox, QGroupBox, QHBoxLayout, QLabel,
-                               QListWidget, QPushButton, QTableWidget,
+from PySide6.QtWidgets import (QCheckBox, QGroupBox, QHBoxLayout, QHeaderView,
+                               QLabel, QListWidget, QPushButton, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..core.models import MigrationPlan
@@ -52,7 +52,13 @@ class PlanPage(QWidget):
 
         self.group_table = QTableWidget(0, len(GROUP_HEADERS))
         self.group_table.setHorizontalHeaderLabels(GROUP_HEADERS)
-        self.group_table.horizontalHeader().setStretchLastSection(True)
+        # 列宽必须显式分配：默认 100px 会把「链接目标目录」这条最长、
+        # 也最关键的信息截成 "C:..."，用户根本看不出链接指向哪个仓库。
+        header = self.group_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
 
         self.unknown_list = QListWidget()
 
@@ -127,6 +133,8 @@ class PlanPage(QWidget):
             self.group_table.insertRow(row)
             prefix_item = QTableWidgetItem(group.prefix)
             prefix_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            # 路径很长仍有被截断的可能，挂上 tooltip 保证全文可见
+            prefix_item.setToolTip(group.prefix)
             self.group_table.setItem(row, 0, prefix_item)
             count_item = QTableWidgetItem(str(group.count))
             count_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
@@ -174,7 +182,14 @@ class PlanPage(QWidget):
         if item is not None:
             item.setText(mapped_to)
 
-    def metric(self, key: str) -> str:
+    def metric_text(self, key: str) -> str:
+        """读取某个指标标签的文本。
+
+        注意：**绝不能把这个方法命名为 `metric`**。QWidget 继承自 QPaintDevice，
+        `metric(PaintDeviceMetric)` 是 Qt 的虚函数，绘制系统靠它查询 DPI /
+        设备像素比。用 Python 覆盖它会让每次绘制都走进这里、
+        拿 PaintDeviceMetric 当 key 去查字典并抛 KeyError，直接导致控件无法绘制。
+        """
         return self.metric_labels[key].text()
 
     def warning_text(self) -> str:
