@@ -13,6 +13,7 @@ __pycache__/
 build/
 dist/
 *.spec
+packaging/app.ico
 
 # IDE
 .idea/
