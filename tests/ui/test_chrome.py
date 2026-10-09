@@ -47,6 +47,34 @@ def test_metric_row_unknown_key_returns_empty(qapp):
     assert row.value_text("不存在") == ""
 
 
+def test_metric_row_uses_smaller_font_for_wide_text_values(qapp):
+    """值是一句话时降一档字号，否则大字号会把相邻格挤在一起。
+
+    判断依据是估算显示宽度而不是字符数：「2.2 KB」6 个字符但很窄，
+    「执行时检测」5 个字符却很宽。
+    """
+    row = chrome.MetricRow([("被占用", "执行时检测"), ("数据量", "2.2 KB")])
+    assert row.font_px("被占用") == chrome.MetricRow.VALUE_PX_WIDE
+    assert row.font_px("数据量") == chrome.MetricRow.VALUE_PX
+    assert row.value_text("被占用") == "执行时检测"
+
+
+def test_metric_row_restores_large_font_when_value_shrinks(qapp):
+    """字号必须每次设值时重判：页面是先建占位符、再在 load() 里填真值的。"""
+    row = chrome.MetricRow([("被占用", "-")])
+    assert row.font_px("被占用") == chrome.MetricRow.VALUE_PX
+    row.set_value("被占用", "执行时检测")
+    assert row.font_px("被占用") == chrome.MetricRow.VALUE_PX_WIDE
+    row.set_value("被占用", "0")
+    assert row.font_px("被占用") == chrome.MetricRow.VALUE_PX
+
+
+def test_metric_row_display_width_counts_cjk_as_two(qapp):
+    assert chrome.MetricRow.display_width("2.2 KB") == 6
+    assert chrome.MetricRow.display_width("执行时检测") == 10
+    assert chrome.MetricRow.display_width("482") == 3
+
+
 def test_action_bar_places_widgets(qapp):
     bar = chrome.ActionBar()
     left = QPushButton("左")

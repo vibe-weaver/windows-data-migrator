@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QVBoxLayout, QWidget)
 
 import qfluentwidgets as qf
@@ -138,32 +138,71 @@ class StepBar(QWidget):
 
 
 class MetricRow(QWidget):
-    """一排「大数字 + 小标签」的指标。"""
+    """一排「大数字 + 小标签」的指标。
+
+    值不一定都是数字：例如「被占用」的值是一整句话「执行时检测」。
+    这类长文本若仍用大字号，会把整行挤到相邻两格贴在一起。
+
+    两个关键点：
+    1. 判断依据是**估算显示宽度**而不是字符数——中文单字宽度约是 ASCII 的两倍，
+       「2.2 KB」有 6 个字符却很短，「执行时检测」只有 5 个字符却很宽。
+    2. 字号必须在**每次设值时**重新判定，不能只在构造时定死：
+       页面是先建好指标行、再在 `load()` 里填真值的，构造时拿到的只是占位符。
+    """
+
+    # 估算显示宽度超过这个值就降一档字号
+    LONG_VALUE_WIDTH = 8
+    VALUE_PX = 26
+    VALUE_PX_WIDE = 16
+
+    @staticmethod
+    def display_width(text: str) -> int:
+        """粗略估算显示宽度：CJK 及全角字符记 2，其余记 1。"""
+        return sum(2 if ord(ch) > 0x2E80 else 1 for ch in str(text))
 
     def __init__(self, items, parent=None):
         super().__init__(parent)
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(0)
-        self._values: dict[str, qf.TitleLabel] = {}
+        self._values: dict[str, qf.BodyLabel] = {}
         for key, value in items:
             box = QVBoxLayout()
             box.setSpacing(2)
-            big = qf.TitleLabel(value)
+            big = qf.BodyLabel(str(value))
             caption = qf.CaptionLabel(key)
             box.addWidget(big)
             box.addWidget(caption)
             row.addLayout(box, 1)
             self._values[key] = big
+            self._apply_emphasis(key, value)
+
+    def _apply_emphasis(self, key: str, text) -> None:
+        """按显示宽度决定字号：数字用大字号，说明性文本降一档。"""
+        label = self._values.get(key)
+        if label is None:
+            return
+        px = (self.VALUE_PX if self.display_width(text) <= self.LONG_VALUE_WIDTH
+              else self.VALUE_PX_WIDE)
+        font = QFont(label.font())
+        font.setPixelSize(px)
+        label.setFont(font)
 
     def value_text(self, key: str) -> str:
         label = self._values.get(key)
         return label.text() if label is not None else ""
 
+    def font_px(self, key: str) -> int:
+        """当前值标签的字号（供测试判断是否降档）。"""
+        label = self._values.get(key)
+        return label.font().pixelSize() if label is not None else 0
+
     def set_value(self, key: str, text: str) -> None:
         label = self._values.get(key)
-        if label is not None:
-            label.setText(text)
+        if label is None:
+            return
+        label.setText(str(text))
+        self._apply_emphasis(key, text)
 
 
 class ActionBar(QWidget):
