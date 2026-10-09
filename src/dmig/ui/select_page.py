@@ -113,7 +113,10 @@ class SelectPage(QWidget):
         layout.setSpacing(12)
         layout.addWidget(source_card)
         layout.addWidget(target_card)
-        layout.addWidget(check_card, 1)
+        # 校验卡片按内容自适应高度，剩余空间留给末尾的 stretch——
+        # 给它 stretch 会让卡片撑满整屏、把提示行推到卡片底部，中间空一大片。
+        layout.addWidget(check_card)
+        layout.addStretch(1)
 
         self.source_browse.clicked.connect(lambda: self._browse(self.source_edit))
         self.target_browse.clicked.connect(lambda: self._browse(self.target_edit))
@@ -159,9 +162,13 @@ class SelectPage(QWidget):
 
         三种状态互斥：未选目录给中性指引，校验通过给一行绿色结论，
         存在问题时两条都藏起来，把版面让给 `issues_list`。
+
+        列表只在**真有问题**时才显示：无问题时它那一项只是同一句话的复述
+        （列表内容必须保留，`issues_text()` 依赖它），显示出来就是重复。
         """
         self._check_hint.setVisible(state == self.HINT_EMPTY)
         self._check_pass.setVisible(state == self.HINT_PASS)
+        self.issues_list.setVisible(state == self.HINT_ISSUES)
 
     # --- 对外接口 ---------------------------------------------------
     def source(self) -> str:
