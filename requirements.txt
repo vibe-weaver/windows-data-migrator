@@ -1,4 +1,6 @@
 PySide6>=6.6
+PySide6-Fluent-Widgets>=1.11
+darkdetect>=0.8
 
 # 开发/测试依赖（单独安装）
 pytest>=8.0
