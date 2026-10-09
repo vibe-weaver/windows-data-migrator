@@ -18,6 +18,7 @@ ACCENT = "#0067c0"
 ACCENT_DARK = "#4cc2ff"
 SUCCESS = ("#0f7b0f", "#6ccb5f")   # (浅色, 深色)
 MUTED = ("#9a9a9a", "#8a8a8a")     # (浅色, 深色)
+ERROR = ("#c42b1c", "#ff99a4")     # (浅色, 深色)
 
 MODES: tuple[str, ...] = ("auto", "light", "dark")
 

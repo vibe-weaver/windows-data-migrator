@@ -1,11 +1,20 @@
-"""向导第四步：结果统计、未完成清单与收尾动作。"""
+"""向导第四步：结果统计、未完成清单与收尾动作。
+
+界面改用 Fluent 控件：标题用 TitleLabel，两个分区用 `chrome.Card` 圆角卡片，
+统计值用 `qf.StrongBodyLabel`，清单用 `qf.TableWidget`。
+颜色一律从 `theme` 取（成功 `theme.SUCCESS` / 未完成 `theme.ERROR`），
+本模块不出现任何颜色字面量。
+"""
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (QFileDialog, QFormLayout, QGroupBox, QHeaderView,
-                               QHBoxLayout, QLabel, QPushButton, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QFileDialog, QFormLayout, QHBoxLayout,
+                               QHeaderView, QTableWidgetItem, QVBoxLayout,
+                               QWidget)
 
+import qfluentwidgets as qf
+
+from . import chrome, theme
 from .format import human_bytes
 from .report import CSV_HEADER, build_rows, summarize, unfinished_rows, write_csv
 
@@ -28,20 +37,31 @@ class ReportPage(QWidget):
         super().__init__(parent)
         self._outcome = None
 
-        self.title_label = QLabel("-")
-        self.message_label = QLabel("")
+        self.title_label = qf.TitleLabel("-")
+
+        self.message_label = qf.BodyLabel("")
         self.message_label.setWordWrap(True)
 
-        self.stat_labels: dict[str, QLabel] = {}
-        stats_box = QGroupBox("统计")
-        stats_layout = QFormLayout(stats_box)
+        stats_card = chrome.Card()
+        stats_layout = QVBoxLayout(stats_card)
+        stats_layout.setContentsMargins(20, 16, 20, 16)
+        stats_layout.setSpacing(10)
+        stats_layout.addWidget(qf.StrongBodyLabel("统计"))
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(6)
+        self.stat_labels: dict[str, qf.StrongBodyLabel] = {}
         for key, title in STAT_ROWS:
-            value = QLabel("0")
+            value = qf.StrongBodyLabel("0")
             value.setObjectName(f"stat_{key}")
-            stats_layout.addRow(title, value)
+            form.addRow(qf.BodyLabel(title), value)
             self.stat_labels[key] = value
+        stats_layout.addLayout(form)
 
-        self.table = QTableWidget(0, len(CSV_HEADER))
+        # qf.TableWidget() 不接受行列数，行数用 setRowCount，列数用 setColumnCount
+        self.table = qf.TableWidget()
+        self.table.setColumnCount(len(CSV_HEADER))
+        self.table.setRowCount(0)
         self.table.setHorizontalHeaderLabels(CSV_HEADER)
         # 列宽显式分配：默认 100px 会把「相对路径」截成 "data\..."，
         # 用户看不出是哪个文件没完成。
@@ -52,15 +72,21 @@ class ReportPage(QWidget):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
 
-        table_box = QGroupBox("未完成清单")
-        table_layout = QVBoxLayout(table_box)
-        table_layout.addWidget(self.table)
+        table_card = chrome.Card()
+        table_layout = QVBoxLayout(table_card)
+        table_layout.setContentsMargins(20, 16, 20, 16)
+        table_layout.setSpacing(10)
+        table_layout.addWidget(qf.StrongBodyLabel("未完成清单"))
+        table_layout.addWidget(self.table, 1)
 
-        self.export_button = QPushButton("导出 CSV")
-        self.reverify_button = QPushButton("重新校验")
-        self.rollback_button = QPushButton("一键回滚")
-        self.cleanup_button = QPushButton("删除备份")
+        # 破坏性动作用普通按钮，不抢主色
+        self.export_button = qf.PushButton("导出 CSV")
+        self.reverify_button = qf.PushButton("重新校验")
+        self.rollback_button = qf.PushButton("一键回滚")
+        self.cleanup_button = qf.PushButton("删除备份")
         buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.setSpacing(10)
         buttons.addWidget(self.export_button)
         buttons.addWidget(self.reverify_button)
         buttons.addStretch(1)
@@ -68,10 +94,12 @@ class ReportPage(QWidget):
         buttons.addWidget(self.cleanup_button)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
         layout.addWidget(self.title_label)
         layout.addWidget(self.message_label)
-        layout.addWidget(stats_box)
-        layout.addWidget(table_box, 1)
+        layout.addWidget(stats_card)
+        layout.addWidget(table_card, 1)
         layout.addLayout(buttons)
 
         self.export_button.clicked.connect(self._on_export_clicked)
@@ -84,7 +112,10 @@ class ReportPage(QWidget):
     def load(self, outcome) -> None:
         self._outcome = outcome
         stats = summarize(outcome)
-        self.title_label.setText("迁移成功" if outcome.ok else f"未完成：{outcome.phase}")
+        ok = bool(outcome.ok)
+        self.title_label.setText("迁移成功" if ok else f"未完成：{outcome.phase}")
+        # 成功/未完成用库与 theme 的语义色区分，深浅模式各一个值
+        self.title_label.setTextColor(*(theme.SUCCESS if ok else theme.ERROR))
         for key in self.stat_labels:
             value = stats[key]
             text = human_bytes(value) if key == "copied_bytes" else f"{value:,}"
@@ -99,7 +130,7 @@ class ReportPage(QWidget):
 
         self.message_label.setText(getattr(outcome, "message", "") or "")
         has_backup = bool(getattr(outcome, "backup_path", None))
-        self.set_actions_enabled(rollback=has_backup, cleanup=has_backup)
+        self.set_actions_enabled(has_backup, has_backup)
 
     def set_actions_enabled(self, rollback: bool, cleanup: bool) -> None:
         self.rollback_button.setEnabled(rollback)
