@@ -118,3 +118,34 @@ def test_execute_refuses_on_permission_issues(tmp_path):
     assert out.ok is False
     assert out.phase == "permission_denied"
     assert not (tmp_path / "dst").exists()
+
+
+def test_cleanup_backup_does_not_follow_junctions(tmp_path):
+    r"""删备份时只能删链接本身，绝不能跟进目标。
+
+    备份目录就是改名后的源目录，里面含有指向外部仓库的 junction
+    （真实场景里是 482 个指向 C 盘 npm 缓存的链接）。如果 rmtree 跟进了，
+    删备份就会连外部仓库的真实数据一起删掉——这是不可挽回的数据损坏。
+    """
+    external = tmp_path / "external_store"
+    external.mkdir()
+    (external / "precious.txt").write_text("不能丢的数据", encoding="utf-8")
+    (external / "sub").mkdir()
+    (external / "sub" / "more.txt").write_text("更多数据", encoding="utf-8")
+
+    src = tmp_path / "src"
+    (src / "own").mkdir(parents=True)
+    (src / "own" / "a.txt").write_text("自己的数据", encoding="utf-8")
+    reparse.create_junction(src / "link-ext", external)
+
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+    assert out.ok is True
+
+    # 备份里确实保留了那个链接
+    assert os.path.isdir(os.path.join(out.backup_path, "link-ext"))
+    assert m.cleanup_backup() is True
+
+    # 外部仓库的真实数据必须分毫未动
+    assert (external / "precious.txt").read_text(encoding="utf-8") == "不能丢的数据"
+    assert (external / "sub" / "more.txt").read_text(encoding="utf-8") == "更多数据"
