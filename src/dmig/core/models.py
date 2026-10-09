@@ -16,10 +16,14 @@ class EntryKind(str, Enum):
 
 
 class LinkTargetClass(str, Enum):
+    """链接目标与源树的关系。
+
+    「关系」与「目标是否存在」是正交的两件事——树外的目标同样可能断链，
+    因此断链由 is_dangling 单独表达，不塞进这个枚举。
+    """
     RELATIVE = "relative"
     INSIDE_SOURCE = "inside_source"
     OUTSIDE_SOURCE = "outside_source"
-    DANGLING = "dangling"
 
 
 @dataclass
@@ -30,6 +34,14 @@ class PlanTotals:
 
 
 @dataclass(frozen=True)
+class ResolvedTarget:
+    """resolve_target 的返回值。"""
+    new_target: str
+    target_class: LinkTargetClass
+    is_dangling: bool = False
+
+
+@dataclass(frozen=True)
 class LinkPlan:
     rel: str
     kind: EntryKind
@@ -37,6 +49,7 @@ class LinkPlan:
     new_target: str
     target_class: LinkTargetClass
     is_dir: bool
+    is_dangling: bool = False
 
 
 @dataclass
