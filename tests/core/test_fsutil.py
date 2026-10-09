@@ -79,3 +79,19 @@ def test_drive_of(tmp_path):
 
 def test_volume_free_bytes_is_positive(tmp_path):
     assert fsutil.volume_free_bytes(str(tmp_path)) > 0
+
+
+def test_volume_free_bytes_works_for_missing_path(tmp_path):
+    r"""目标路径整条链都不存在时也必须算出剩余空间。
+
+    否则 disk_usage 抛 FileNotFoundError 被吞掉后变成「剩余 0 字节」，
+    前置校验就会误报空间不足、直接拒绝迁移——迁到任意新的嵌套目录都会踩到。
+    """
+    missing = tmp_path / "no" / "such" / "nested" / "dir"
+    assert fsutil.volume_free_bytes(str(missing)) > 0
+
+
+def test_existing_ancestor_walks_up_to_nearest_existing(tmp_path):
+    missing = tmp_path / "a" / "b" / "c"
+    assert fsutil.existing_ancestor(str(missing)) == str(tmp_path)
+    assert fsutil.existing_ancestor(str(tmp_path)) == str(tmp_path)

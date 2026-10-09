@@ -74,6 +74,19 @@ def test_enough_space_passes(tmp_path):
     assert not guard.has_error(guard.check(src, tmp_path / "b", required_bytes=1024))
 
 
+def test_space_check_works_when_target_chain_missing(tmp_path):
+    r"""目标是全新的嵌套路径时不能误判空间不足。
+
+    目标整条链都不存在时，若 disk_usage 直接抛错被吞成 0，就会报
+    「目标盘剩余 0 MB」并把迁移拒掉——这是真实场景里最常见的目标形态。
+    """
+    src = tmp_path / "a"
+    src.mkdir()
+    (src / "f.bin").write_text("data", encoding="utf-8")
+    deep_target = tmp_path / "no" / "such" / "nested" / "target"
+    assert not guard.has_error(guard.check(src, deep_target, required_bytes=1024))
+
+
 def test_non_empty_target_is_warning_only(tmp_path):
     src = tmp_path / "a"
     src.mkdir()

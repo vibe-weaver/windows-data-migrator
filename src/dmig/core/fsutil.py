@@ -76,6 +76,22 @@ def drive_of(path) -> str:
     return os.path.splitdrive(os.path.abspath(str(path)))[0].upper()
 
 
+def existing_ancestor(path) -> str:
+    r"""返回该路径最近的存在祖先；盘根一定存在，所以必然有返回值。
+
+    预扫描与前置校验都要算目标盘剩余空间，而目标路径（例如 E:\新的\嵌套\目录）
+    常常整条链都还不存在。直接对不存在的路径调 disk_usage 会抛 FileNotFoundError，
+    被上层吞掉后就变成「剩余 0 字节」，进而误报空间不足、直接拒绝迁移。
+    """
+    candidate = os.path.abspath(strip_long_prefix(str(path)))
+    while not os.path.exists(candidate):
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            break
+        candidate = parent
+    return candidate
+
+
 def volume_free_bytes(path) -> int:
     import shutil
-    return shutil.disk_usage(str(path)).free
+    return shutil.disk_usage(existing_ancestor(path)).free
