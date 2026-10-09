@@ -1,0 +1,27 @@
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '080404B0',
+        [StringStruct('CompanyName', '个人项目'),
+         StringStruct('FileDescription', '数据目录迁移工具'),
+         StringStruct('FileVersion', '1.0.0.0'),
+         StringStruct('InternalName', 'dmig'),
+         StringStruct('LegalCopyright', ''),
+         StringStruct('OriginalFilename', '数据迁移工具.exe'),
+         StringStruct('ProductName', '数据目录迁移工具'),
+         StringStruct('ProductVersion', '1.0.0.0')])
+    ]),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)
