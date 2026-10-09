@@ -18,6 +18,42 @@
 - **文件被占用不放弃**：自动重试并查出占用进程，关掉程序后可断点续传
 - **长路径安全**：全程 `\\?\` 前缀，`node_modules` 这类深层目录不会失败
 
+## 图形界面
+
+直接双击 `dist\数据迁移工具.exe`，或开发时运行：
+
+```powershell
+& '.\env\Scripts\python.exe' app.py
+```
+
+四步向导：
+
+1. **选择目录**——源目录、目标目录（支持拖拽），实时显示两个卷的剩余空间与前置校验结果
+2. **迁移计划**——真实数据量、文件数、目录数、链接数、需提权目录数、预计耗时；
+   链接目标归属表列出所有指向源树之外的链接，可逐条填写「重写为」的新路径后
+   点「应用映射并重新扫描」；无权限时点「以管理员身份重试」
+3. **执行迁移**——总进度、当前文件、速度、剩余时间、滚动日志；可暂停/取消；
+   失败清单显示占用进程名与 PID，双击可定位
+4. **结果报告**——成功/失败/跳过统计、未完成清单、导出 CSV、一键回滚、删除备份
+
+启动参数：
+
+- `--elevated`——由「以管理员身份重试」自动带上，无需手输
+- `--session <id>`——恢复指定会话（提权重启时用于把任务带回界面）
+
+## 打包
+
+```powershell
+pwsh -File packaging\build.ps1          # 只出图形界面版
+pwsh -File packaging\build.ps1 -Cli     # 额外出一个命令行版
+```
+
+产物在 `dist\`：
+
+- `数据迁移工具.exe`——单文件图形界面版，内嵌 `asInvoker` 清单，双击不弹 UAC
+- `数据迁移工具-cli.exe`——加 `-Cli` 时才有；`--windowed` 的 exe 没有控制台，
+  想在终端里用子命令请用这个版本
+
 ## 命令行用法
 
 ```powershell
@@ -38,11 +74,7 @@ python app.py migrate --source D:\a --target E:\b --yes --sha256
 ## 开发
 
 ```powershell
-& '.\env\Scripts\python.exe' -m pip install -i https://mirrors.aliyun.com/pypi/simple/ pytest
+& '.\env\Scripts\python.exe' -m pip install -i https://mirrors.aliyun.com/pypi/simple/ -r requirements.txt
 & '.\env\Scripts\python.exe' -m pytest -q
 ```
 
-## 设计文档
-
-- 设计：[docs/superpowers/specs/2026-10-09-windows-data-migration-tool-design.md](docs/superpowers/specs/2026-10-09-windows-data-migration-tool-design.md)
-- 计划：[docs/superpowers/plans/2026-10-09-migration-core.md](docs/superpowers/plans/2026-10-09-migration-core.md)
