@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
-                               QLabel, QPushButton, QTableWidget,
+from PySide6.QtWidgets import (QFileDialog, QFormLayout, QGroupBox, QHeaderView,
+                               QHBoxLayout, QLabel, QPushButton, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .format import human_bytes
@@ -43,7 +43,14 @@ class ReportPage(QWidget):
 
         self.table = QTableWidget(0, len(CSV_HEADER))
         self.table.setHorizontalHeaderLabels(CSV_HEADER)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        # 列宽显式分配：默认 100px 会把「相对路径」截成 "data\..."，
+        # 用户看不出是哪个文件没完成。
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
 
         table_box = QGroupBox("未完成清单")
         table_layout = QVBoxLayout(table_box)

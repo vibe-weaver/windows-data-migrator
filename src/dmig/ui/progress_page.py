@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QPlainTextEdit,
-                               QProgressBar, QPushButton, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QGroupBox, QHeaderView, QHBoxLayout, QLabel,
+                               QPlainTextEdit, QProgressBar, QPushButton,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout,
+                               QWidget)
 
 from ..core.models import CopyFailure, Progress
 from .format import human_bytes, human_duration, human_speed
@@ -59,7 +60,13 @@ class ProgressPage(QWidget):
 
         self.failure_table = QTableWidget(0, len(FAILURE_HEADERS))
         self.failure_table.setHorizontalHeaderLabels(FAILURE_HEADERS)
-        self.failure_table.horizontalHeader().setStretchLastSection(True)
+        # 列宽显式分配：默认 100px 会把「相对路径」截成 "data\..."，
+        # 用户看不出到底是哪个文件失败；路径列需要更多空间。
+        header = self.failure_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
 
         failure_box = QGroupBox("失败清单（双击「占用进程」列可定位进程）")
         failure_layout = QVBoxLayout(failure_box)
