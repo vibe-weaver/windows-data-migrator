@@ -1,14 +1,28 @@
-"""主窗口：四步向导的装配与线程调度。"""
+"""主窗口：四步向导的装配与线程调度。
+
+窗口基类换成 `FluentWindow`，外壳（品牌栏 / 步骤条 / 内容区 / 操作栏）交给
+`chrome`。三条实测结论直接决定了这里的写法：
+
+1. `theme.apply_theme()` **必须在任何页面/控件构造之前**调用。该库的主题是
+   逐个控件注册样式的（`common/style_sheet.py` 遍历 `styleSheetManager` 重刷），
+   `app.styleSheet()` 始终为空；顺序错了就会出现「控件文字变白、背景还是白的」。
+2. 必须 `setMicaEffectEnabled(False)`：Mica 开着时窗口背景跟随**操作系统**主题
+   而不是库的主题，强制主题与系统不符时就是白底白字，浅色机器上也没法验证深色。
+3. 背景用 `setCustomBackgroundColor` 显式指定库自带的浅/深背景色
+   （`theme.WINDOW_BACKGROUND`），不自造配色。
+"""
 from __future__ import annotations
 
 import sys
 
-from PySide6.QtWidgets import (QApplication, QHBoxLayout, QMainWindow,
-                               QMessageBox, QPushButton, QStackedWidget,
-                               QStatusBar, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QMessageBox,
+                               QStackedWidget, QVBoxLayout, QWidget)
+
+import qfluentwidgets as qf
 
 from ..core.migrator import Migrator
 from ..core.session import Session, default_root
+from . import chrome, theme
 from .plan_page import PlanPage
 from .progress_page import ProgressPage
 from .report_page import ReportPage
@@ -27,13 +41,47 @@ def default_migrator_factory(source, target, mappings, deep_verify, session_root
                     session_root=session_root)
 
 
-class MainWindow(QMainWindow):
+class StatusLine(QWidget):
+    """底部状态行，替代 `QStatusBar`。
+
+    `QStatusBar` 是原生 Qt 控件，不参与 Fluent 的逐控件主题注册，深色模式下
+    它仍是默认的黑色文字，落在窗口的深色背景上就是一行看不见的字。这里换成
+    Fluent 的 `CaptionLabel`，颜色由库的主题负责。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(24, 0, 24, 10)
+        row.setSpacing(0)
+        self._label = qf.CaptionLabel("")
+        row.addWidget(self._label)
+        row.addStretch(1)
+
+    def showMessage(self, message: str) -> None:      # noqa: N802 - 对齐 QStatusBar
+        self._label.setText(message)
+
+    def text(self) -> str:
+        return self._label.text()
+
+
+class MainWindow(qf.FluentWindow):
     """四步向导：选择 → 计划 → 执行 → 报告。"""
 
     def __init__(self, migrator_factory=None, session_id=None, parent=None):
+        # 主题必须在任何控件之前落定：控件是在构造时注册样式的。
+        theme.apply_theme("auto")
         super().__init__(parent)
+
+        # 关掉 Mica，并显式指定背景色，让窗口背景跟随库的主题而非系统主题。
+        self.setMicaEffectEnabled(False)
+        self.setCustomBackgroundColor(*theme.WINDOW_BACKGROUND)
+
         self.setWindowTitle("数据目录迁移工具")
         self.resize(1000, 740)
+
+        # 本应用是线性向导，不需要左侧导航栏。
+        self.navigationInterface.hide()
 
         self._factory = migrator_factory or default_migrator_factory
         self._migrator = None
@@ -51,19 +99,30 @@ class MainWindow(QMainWindow):
                      self.progress_page, self.report_page):
             self.stack.addWidget(page)
 
-        self.back_button = QPushButton("上一步")
-        self.next_button = QPushButton("下一步")
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        buttons.addWidget(self.back_button)
-        buttons.addWidget(self.next_button)
+        self.brand_bar = chrome.BrandBar()
+        self.step_bar = chrome.StepBar(["选择目录", "确认计划", "执行迁移", "完成"])
+
+        self.back_button = qf.PushButton("上一步")
+        self.next_button = qf.PrimaryPushButton("下一步")
+        self.action_bar = chrome.ActionBar()
+        self.action_bar.add_left(self.back_button)
+        self.action_bar.add_right(self.next_button)
+        self.status_line = StatusLine()
 
         central = QWidget()
         layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.brand_bar)
+        layout.addWidget(self.step_bar)
         layout.addWidget(self.stack, 1)
-        layout.addLayout(buttons)
-        self.setCentralWidget(central)
-        self.setStatusBar(QStatusBar())
+        layout.addWidget(self.action_bar)
+        layout.addWidget(self.status_line)
+
+        # 库自带的 stackedWidget 是 QFrame 而不是 QStackedWidget，用不上；
+        # 隐藏后把自建容器放进同一个 widgetLayout（它已经预留了标题栏的 48px）。
+        self.stackedWidget.hide()
+        self.widgetLayout.addWidget(central, 1)
 
         self.next_button.clicked.connect(self.go_next)
         self.back_button.clicked.connect(self.go_back)
@@ -81,6 +140,10 @@ class MainWindow(QMainWindow):
             self.restore_session(session_id)
         self._update_buttons()
 
+    def statusBar(self) -> StatusLine:                # noqa: N802 - 对齐 QMainWindow
+        """保留原来的 `statusBar().showMessage(...)` 调用点。"""
+        return self.status_line
+
     # --- 导航 -------------------------------------------------------
     def current_index(self) -> int:
         return self.stack.currentIndex()
@@ -97,6 +160,7 @@ class MainWindow(QMainWindow):
         elif index == PAGE_PROGRESS:
             self.stack.setCurrentIndex(PAGE_REPORT)
             self._update_buttons()
+        self._sync_step()
 
     def go_back(self) -> None:
         if self.is_busy():
@@ -104,10 +168,16 @@ class MainWindow(QMainWindow):
         if self.current_index() == PAGE_PLAN:
             self.stack.setCurrentIndex(PAGE_SELECT)
             self._update_buttons()
+        self._sync_step()
+
+    def _sync_step(self) -> None:
+        """步骤条与内容区始终同步（切换可能发生在异步回调里）。"""
+        self.step_bar.set_current(self.stack.currentIndex())
 
     def _update_buttons(self) -> None:
         index = self.current_index()
         busy = self.is_busy()
+        self._sync_step()
         self.back_button.setEnabled(not busy and index == PAGE_PLAN)
         if index == PAGE_SELECT:
             self.next_button.setText("开始扫描")

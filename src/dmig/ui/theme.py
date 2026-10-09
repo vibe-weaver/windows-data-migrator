@@ -16,6 +16,9 @@ import qfluentwidgets as qf
 
 ACCENT = "#0067c0"
 ACCENT_DARK = "#4cc2ff"
+# 窗口背景（浅色, 深色）：取库自带 `FluentWidget` 的默认背景色，不自造配色。
+# 关掉 Mica 后由 `setCustomBackgroundColor` 显式指定，窗口背景才会跟随库主题。
+WINDOW_BACKGROUND = ("#f0f4f9", "#202020")
 SUCCESS = ("#0f7b0f", "#6ccb5f")   # (浅色, 深色)
 MUTED = ("#9a9a9a", "#8a8a8a")     # (浅色, 深色)
 ERROR = ("#c42b1c", "#ff99a4")     # (浅色, 深色)
