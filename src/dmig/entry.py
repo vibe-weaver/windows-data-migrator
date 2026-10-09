@@ -47,9 +47,35 @@ def parse_launch_args(argv: list[str]) -> dict:
     return result
 
 
+def force_utf8_stdio(streams=None) -> None:
+    r"""把**被重定向**的标准输出/错误切到 UTF-8。
+
+    背景：frozen 的 `--windowed` exe 在 stdout 被重定向时默认用系统 ANSI 代码页
+    （中文系统是 cp936），而 `scan` 输出的计划 JSON 含中文路径，
+    按 UTF-8 解码的消费方会直接报 `invalid continuation byte`。
+
+    但**交互式控制台不能动**：中文控制台本身就是 cp936，
+    强行改成 UTF-8 会让中文显示成乱码。所以只处理非 tty 的流。
+    GUI 模式下 stdout 是 None，跳过。
+    """
+    for stream in (sys.stdout, sys.stderr) if streams is None else streams:
+        if stream is None:
+            continue
+        try:
+            if stream.isatty():
+                continue
+        except Exception:
+            pass
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     if is_cli_invocation(argv):
+        force_utf8_stdio()
         from .cli import main as cli_main
         return cli_main(argv[1:])
     from .ui.main_window import run_gui

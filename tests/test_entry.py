@@ -55,6 +55,58 @@ def test_main_dispatches_to_cli(monkeypatch):
     assert captured["argv"] == ["scan", "--source", "x"]
 
 
+class _FakeStream:
+    """够用的假流：能记住是否 tty、能否 reconfigure。"""
+
+    def __init__(self, tty: bool):
+        self._tty = tty
+        self.reconfigured = None
+
+    def isatty(self) -> bool:
+        return self._tty
+
+    def reconfigure(self, **kwargs) -> None:
+        self.reconfigured = kwargs
+
+
+def test_force_utf8_stdio_only_touches_redirected_streams():
+    """被重定向的流切 UTF-8；交互式控制台保持原编码。
+
+    中文控制台本身是 cp936，强行 UTF-8 会让中文变乱码，所以不能无脑切。
+    """
+    pipe = _FakeStream(tty=False)
+    console = _FakeStream(tty=True)
+    entry.force_utf8_stdio([pipe, console])
+    assert pipe.reconfigured is not None
+    assert pipe.reconfigured.get("encoding") == "utf-8"
+    assert console.reconfigured is None
+
+
+def test_force_utf8_stdio_tolerates_none_and_broken_streams():
+    """GUI 模式下 stdout 是 None；某些流也不支持 reconfigure——都不能抛。"""
+    class _NoReconfigure:
+        def isatty(self):
+            return False
+
+    entry.force_utf8_stdio([None, _NoReconfigure()])
+
+
+def test_force_utf8_stdio_tolerates_stream_without_isatty():
+    class _Bare:
+        def __init__(self):
+            self.reconfigured = None
+
+        def isatty(self):
+            raise OSError("boom")
+
+        def reconfigure(self, **kwargs):
+            self.reconfigured = kwargs
+
+    bare = _Bare()
+    entry.force_utf8_stdio([bare])
+    assert bare.reconfigured is not None
+
+
 def test_main_dispatches_to_gui(monkeypatch):
     import dmig.ui.main_window as window_mod
     captured = {}
