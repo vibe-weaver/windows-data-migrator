@@ -1,0 +1,22 @@
+# 虚拟环境
+env/
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# IDE
+.idea/
+
+# 运行期数据
+logs/
+sessions/
