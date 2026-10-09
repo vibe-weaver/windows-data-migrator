@@ -1,19 +1,31 @@
-"""向导第一步：选择源目录与目标目录，并实时给出前置校验结果。"""
+"""向导第一步：选择源目录与目标目录，并实时给出前置校验结果。
+
+外观全部交给 Fluent 控件与 `chrome` 外壳，本模块不写任何颜色字面量：
+需要表达「校验通过」时用 `theme` 里的语义色，深浅两色成对给出。
+"""
 from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
-                               QLabel, QLineEdit, QListWidget, QPushButton,
-                               QVBoxLayout, QWidget)
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QVBoxLayout,
+                               QWidget)
+
+import qfluentwidgets as qf
 
 from ..core import guard
 from ..core.fsutil import drive_of, volume_free_bytes
+from . import chrome
 from .format import human_bytes
+from .theme import SUCCESS
+
+# 校验区在「没有问题」时的说明文案。它只影响这一行提示，
+# 不影响 issues_list 的内容与 issues() 的返回值。
+EMPTY_HINT = "尚未选择源目录时，这里会列出前置校验的结果"
+PASS_HINT = "前置校验通过，可以继续下一步"
 
 
-class PathLineEdit(QLineEdit):
+class PathLineEdit(qf.LineEdit):
     """可以拖入目录的路径输入框。"""
 
     dropped = Signal(str)
@@ -68,25 +80,40 @@ class SelectPage(QWidget):
 
         self.source_edit = PathLineEdit()
         self.target_edit = PathLineEdit()
-        self.source_browse = QPushButton("浏览…")
-        self.target_browse = QPushButton("浏览…")
-        self.source_free = QLabel("-")
-        self.target_free = QLabel("-")
-        self.issues_list = QListWidget()
+        self.source_browse = qf.PushButton("浏览…")
+        self.target_browse = qf.PushButton("浏览…")
+        self.source_free = qf.StrongBodyLabel("-")
+        self.target_free = qf.StrongBodyLabel("-")
+        self.issues_list = qf.ListWidget()
 
-        form = QFormLayout()
-        form.addRow("源目录", self._row(self.source_edit, self.source_browse,
-                                        self.source_free))
-        form.addRow("目标目录", self._row(self.target_edit, self.target_browse,
-                                          self.target_free))
+        # 空状态说明行：一条中性提示 + 一条成功提示，二者互斥显示。
+        # 分成两个控件是为了不让成功语义色串到中性文案上
+        # （FluentLabelBase.setTextColor 一旦调用就再也回不到主题默认色）。
+        self._check_hint = qf.CaptionLabel(EMPTY_HINT)
+        self._check_pass = qf.CaptionLabel(PASS_HINT)
+        self._check_pass.setTextColor(*SUCCESS)
+        self._check_pass.hide()
 
-        box = QGroupBox("前置校验")
-        box_layout = QVBoxLayout(box)
-        box_layout.addWidget(self.issues_list)
+        source_card = self._path_card("源目录", self.source_edit,
+                                      self.source_browse, self.source_free)
+        target_card = self._path_card("目标目录", self.target_edit,
+                                      self.target_browse, self.target_free)
+
+        check_card = chrome.Card()
+        check_layout = QVBoxLayout(check_card)
+        check_layout.setContentsMargins(16, 14, 16, 14)
+        check_layout.setSpacing(8)
+        check_layout.addWidget(qf.StrongBodyLabel("前置校验"))
+        check_layout.addWidget(self._check_hint)
+        check_layout.addWidget(self._check_pass)
+        check_layout.addWidget(self.issues_list)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(box, 1)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+        layout.addWidget(source_card)
+        layout.addWidget(target_card)
+        layout.addWidget(check_card, 1)
 
         self.source_browse.clicked.connect(lambda: self._browse(self.source_edit))
         self.target_browse.clicked.connect(lambda: self._browse(self.target_edit))
@@ -94,18 +121,29 @@ class SelectPage(QWidget):
             edit.textChanged.connect(self._on_changed)
             edit.dropped.connect(self._on_changed)
 
+        self.refresh_check()
+
     @staticmethod
-    def _row(edit: QLineEdit, browse: QPushButton, free: QLabel) -> QWidget:
-        holder = QWidget()
-        row = QHBoxLayout(holder)
+    def _path_card(title: str, edit: qf.LineEdit, browse: qf.PushButton,
+                   free: QLabel) -> QWidget:
+        """一个路径行卡片：小标题 + 输入框 + 浏览按钮 + 剩余空间。"""
+        card = chrome.Card()
+        box = QVBoxLayout(card)
+        box.setContentsMargins(16, 12, 16, 12)
+        box.setSpacing(6)
+        box.addWidget(qf.CaptionLabel(title))
+
+        row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
         row.addWidget(edit, 1)
         row.addWidget(browse)
-        row.addWidget(QLabel("剩余"))
-        row.addWidget(free)
-        return holder
+        row.addWidget(qf.CaptionLabel("剩余"), 0, Qt.AlignVCenter)
+        row.addWidget(free, 0, Qt.AlignVCenter)
+        box.addLayout(row)
+        return card
 
-    def _browse(self, edit: QLineEdit) -> None:
+    def _browse(self, edit: qf.LineEdit) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "选择目录", edit.text() or "")
         if chosen:
             edit.setText(chosen)
@@ -113,6 +151,17 @@ class SelectPage(QWidget):
     def _on_changed(self, *_args) -> None:
         self.refresh_check()
         self.changed.emit()
+
+    HINT_EMPTY, HINT_PASS, HINT_ISSUES = "empty", "pass", "issues"
+
+    def _set_hint(self, state: str) -> None:
+        """切换校验区的状态说明行。
+
+        三种状态互斥：未选目录给中性指引，校验通过给一行绿色结论，
+        存在问题时两条都藏起来，把版面让给 `issues_list`。
+        """
+        self._check_hint.setVisible(state == self.HINT_EMPTY)
+        self._check_pass.setVisible(state == self.HINT_PASS)
 
     # --- 对外接口 ---------------------------------------------------
     def source(self) -> str:
@@ -133,6 +182,7 @@ class SelectPage(QWidget):
         self.issues_list.clear()
         if not self.source() or not self.target():
             self._issues = []
+            self._set_hint(self.HINT_EMPTY)
             self.issues_list.addItem("请选择源目录与目标目录")
             return self._issues
         self._issues = guard.check(self.source(), self.target())
@@ -140,7 +190,11 @@ class SelectPage(QWidget):
             prefix = "错误" if issue.severity == "error" else "提示"
             self.issues_list.addItem(f"[{prefix}] {issue.message}")
         if not self._issues:
+            # 空状态不留一大片空白：成功提示 + 一行明确结论。
+            self._set_hint(self.HINT_PASS)
             self.issues_list.addItem("前置校验通过")
+        else:
+            self._set_hint(self.HINT_ISSUES)
         return self._issues
 
     def issues(self) -> list:
