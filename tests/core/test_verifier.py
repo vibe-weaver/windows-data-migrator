@@ -58,3 +58,23 @@ def test_sha256_of_matches_hashlib(tmp_path):
     payload = os.urandom(4096)
     f.write_bytes(payload)
     assert verifier.sha256_of(f) == hashlib.sha256(payload).hexdigest()
+
+
+def test_unreadable_subdirectory_is_reported_not_raised(tmp_path, monkeypatch):
+    """ACL 拒绝的子目录必须被记录为校验不通过，而不是让整趟校验抛异常。"""
+    src, dst = _pair(tmp_path)
+    locked = src / "locked"
+    locked.mkdir()
+    (locked / "secret.txt").write_text("s", encoding="utf-8")
+
+    real_lstat = os.lstat
+
+    def fake_lstat(path, *args, **kwargs):
+        if os.path.basename(str(path)) == "locked":
+            raise PermissionError(13, "denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+    res = verifier.verify(src, dst)          # 不得抛异常
+    assert res.ok is False
+    assert "locked" in res.mismatch
