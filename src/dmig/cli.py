@@ -97,7 +97,13 @@ def main(argv: list[str] | None = None) -> int:
             if not sys.stdin.isatty():
                 print("非交互环境必须显式传 --yes", file=sys.stderr)
                 return 2
-            reply = input(f"确认把 {args.source} 迁移到 {args.target}？(yes/no) ")
+            try:
+                reply = input(f"确认把 {args.source} 迁移到 {args.target}？(yes/no) ")
+            except (EOFError, KeyboardInterrupt):
+                # stdin 到 EOF（脚本调用 / 重定向 / 打包后 --windowed 没有控制台）
+                # 或用户按了 Ctrl+C——都不能吐 Traceback，要干净地拒绝。
+                print("未获得确认，已取消。无人值守请显式传 --yes", file=sys.stderr)
+                return 2
             if reply.strip().lower() not in ("yes", "y"):
                 print("已取消", file=sys.stderr)
                 return 1

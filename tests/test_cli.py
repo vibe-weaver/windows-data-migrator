@@ -41,6 +41,26 @@ def test_migrate_requires_yes_without_tty(tmp_path):
     assert rc == 2
 
 
+def test_migrate_handles_eof_at_confirmation_prompt(tmp_path, monkeypatch, capsys):
+    r"""交互确认时 stdin 到达 EOF，必须干净退出而不是抛 Traceback。
+
+    真实场景：脚本调用、stdin 重定向、打包后 --windowed 的 exe 没有控制台。
+    pytest 下 sys.stdin.isatty() 为 False 会在到达 input() 之前就返回，
+    所以必须把 isatty 打桩为 True，才能真的覆盖这条路径。
+    """
+    src = _tree(tmp_path)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    def raise_eof(prompt=""):
+        raise EOFError()
+
+    monkeypatch.setattr("builtins.input", raise_eof)
+    rc = cli.main(["migrate", "--source", str(src), "--target", str(tmp_path / "dst")])
+    assert rc == 2
+    assert "已取消" in capsys.readouterr().err
+    assert not (tmp_path / "dst").exists()
+
+
 def test_migrate_with_yes_completes(tmp_path, capsys):
     src = _tree(tmp_path)
     dst = tmp_path / "dst"
