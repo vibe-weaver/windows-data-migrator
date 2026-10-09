@@ -1,4 +1,6 @@
-# 运行时无第三方依赖
+PySide6>=6.6
+
 # 开发/测试依赖（单独安装）
 pytest>=8.0
+pytest-qt>=4.4
 pyinstaller>=6.0
