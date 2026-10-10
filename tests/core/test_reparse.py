@@ -86,3 +86,54 @@ def test_create_symlink_reports_privilege_error(tmp_path):
     assert _is_reparse(link)
     os.rmdir(link)
     pytest.skip("当前环境有符号链接权限")
+
+
+def test_copy_reparse_data_is_byte_identical(tmp_path, make_reparse_file,
+                                             raw_reparse_buffer):
+    """读不动的重解析点要能原样搬走（AppExecLink 连 open 都被拒）。"""
+    src = make_reparse_file(tmp_path / "src.exe")
+    dst = tmp_path / "dst.exe"
+    reparse.copy_reparse_data(src, dst)
+    assert reparse.read_raw(dst) == raw_reparse_buffer(0x8000001B)
+
+
+def test_copy_reparse_data_handles_dir_shape(tmp_path, make_reparse_file):
+    src = make_reparse_file(tmp_path / "srcdir", is_dir=True)
+    dst = tmp_path / "dstdir"
+    reparse.copy_reparse_data(src, dst)
+    assert _is_reparse(dst)
+    assert reparse.read_raw(dst) == reparse.read_raw(src)
+
+
+def test_copy_reparse_data_can_rerun_onto_the_same_destination(
+        tmp_path, make_reparse_file):
+    """续传的第二趟会把已经搬过的条目再走一遍，不能因此失败。
+
+    目标端那时已经带着同一个未处理标签：open() 打不开它（Invalid argument），
+    FSCTL_SET_REPARSE_POINT 也不接受覆盖，实测整趟会栽在一个早已复制好的文件上。
+    """
+    for name, is_dir in (("app.exe", False), ("wci", True)):
+        src = make_reparse_file(tmp_path / f"src-{name}", is_dir=is_dir)
+        dst = tmp_path / f"dst-{name}"
+        reparse.copy_reparse_data(src, dst)
+        reparse.copy_reparse_data(src, dst)
+        assert _is_reparse(dst)
+        assert reparse.read_raw(dst) == reparse.read_raw(src)
+
+
+def test_delete_reparse_point_restores_plain_file(tmp_path, make_reparse_file):
+    path = make_reparse_file(tmp_path / "app.exe")
+    assert _is_reparse(path)
+    reparse.delete_reparse_point(path)
+    assert not _is_reparse(path)
+    # 摘掉标签后就是普通文件，能正常读写与删除
+    with open(path, "wb") as handle:
+        handle.write(b"plain")
+    os.unlink(path)
+
+
+def test_delete_reparse_point_on_plain_file_is_noop(tmp_path):
+    path = tmp_path / "plain.txt"
+    path.write_text("x", encoding="utf-8")
+    reparse.delete_reparse_point(path)
+    assert path.read_text(encoding="utf-8") == "x"

@@ -27,6 +27,13 @@ PROCESS_COLUMN = 2
 REASON_TEXT = {
     "locked": "被占用",
     "io_error": "读写错误",
+    "disk_full": "目标卷空间不足",
+    "symlink_privilege": "缺符号链接特权",
+}
+
+PHASE_TEXT = {
+    "copying": "复制中 ",
+    "verifying": "校验中 ",
 }
 
 BAR_STEPS = 1000
@@ -42,6 +49,7 @@ class ProgressPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._paused = False
+        self._phase = ""
 
         # 构造签名是 (parent, useAni)，第二个位置参数**不是** parent；
         # 这里用命名参数，避免把 useAni 当成 parent 传进去。
@@ -119,6 +127,11 @@ class ProgressPage(QWidget):
 
     # --- 对外接口 ---------------------------------------------------
     def update_progress(self, progress: Progress) -> None:
+        phase = getattr(progress, "phase", "") or ""
+        if phase != self._phase:
+            self._phase = phase
+            if phase == "verifying":
+                self.append_log("[校验] 开始比对源与目标…")
         total = max(int(progress.total_bytes or 0), 0)
         done = max(int(progress.done_bytes or 0), 0)
         if total <= 0:
@@ -130,6 +143,7 @@ class ProgressPage(QWidget):
         self.eta_label.setText(human_duration(progress.eta_seconds)
                                if progress.eta_seconds else "-")
         self.count_label.setText(
+            f"{PHASE_TEXT.get(phase, '')}"
             f"{progress.done_files:,} / {progress.total_files:,} 个文件，"
             f"{human_bytes(done)} / {human_bytes(total)}")
 
@@ -172,6 +186,7 @@ class ProgressPage(QWidget):
         self.log.clear()
         self.failure_table.setRowCount(0)
         self._paused = False
+        self._phase = ""
         self.pause_button.setText("暂停")
 
     def set_running(self, running: bool) -> None:

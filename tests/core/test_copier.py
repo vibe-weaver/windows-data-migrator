@@ -1,3 +1,4 @@
+import errno
 import os
 import stat
 import subprocess
@@ -68,6 +69,26 @@ def test_skips_already_copied_files_on_resume(tmp_path):
     assert sess2.done["files"] == first
 
 
+def test_skipped_files_are_not_reported_as_copied(tmp_path):
+    """C7：全部跳过的续传原来会报「成功复制 2」，实际一个字节都没写。"""
+    src, external = _tree(tmp_path)
+    dst = tmp_path / "dst"
+    plan = scanner.scan(src, dst)
+    sess = Session.create(src, dst, root=tmp_path / "sessions")
+    copier.run(plan, sess)
+
+    seen = []
+    resumed = Session.load(sess.path)
+    result = copier.run(plan, resumed, on_progress=seen.append)
+    assert (result.copied_files, result.copied_bytes) == (0, 0)
+    assert result.skipped == 2
+    assert result.skipped_bytes == 1003
+    # 进度条要用「已处理」口径，否则全量续传跑完只走到 0%
+    assert result.accounted_bytes == 1003
+    assert seen[-1].done_bytes == plan.totals.bytes
+    assert seen[-1].done_files == 2
+
+
 def test_progress_callback_reports_bytes(tmp_path):
     src, external = _tree(tmp_path)
     seen = []
@@ -136,3 +157,336 @@ def test_copy_one_reports_bytes(tmp_path):
     dst = tmp_path / "d.bin"
     assert copier.copy_one(src, dst) == 333
     assert dst.read_bytes() == b"z" * 333
+
+
+def test_same_size_residue_is_overwritten_not_skipped(tmp_path):
+    """A2 回归：目标端同大小的残留文件必须被真实内容覆盖。
+
+    修复前只比大小就跳过，残留内容原样留下，默认校验又看不出差别，
+    于是「校验通过 → 改名备份 → 删备份」把源数据永久丢掉。
+    这里把残留的时间戳也设成与源完全相同，复现最坏情况：实测同一系统
+    时钟节拍（约 15ms）内写入的两个文件 st_mtime_ns 完全相等，
+    任何基于大小/时间戳的启发式都区分不出来，只能靠会话记账。
+    """
+    src, external = _tree(tmp_path)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "two.bin").write_bytes(b"9" * 1000)      # 同大小、内容不同的残留
+    st = os.stat(src / "two.bin")
+    os.utime(dst / "two.bin", ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert os.stat(dst / "two.bin").st_mtime_ns == st.st_mtime_ns
+
+    plan = scanner.scan(src, dst)
+    sess = Session.create(src, dst, root=tmp_path / "sessions")
+    assert sess.completed_rels() == set(), "全新会话不该有任何记账"
+    result = copier.run(plan, sess)
+    assert (dst / "two.bin").read_bytes() == b"2" * 1000
+    assert result.skipped == 0
+    assert not result.failures
+
+
+def test_resume_skips_only_files_this_session_copied(tmp_path):
+    """续传时按会话记账跳过，且跳过的那份确实与源一致。"""
+    src, external = _tree(tmp_path)
+    dst = tmp_path / "dst"
+    plan = scanner.scan(src, dst)
+    sess = Session.create(src, dst, root=tmp_path / "sessions")
+    first = copier.run(plan, sess)
+    assert first.skipped == 0
+    assert sess.completed_rels() == {"two.bin", os.path.join("a", "one.txt")}
+
+    resumed = Session.load(sess.path)
+    second = copier.run(plan, resumed)
+    assert second.skipped == first.copied_files
+    assert not second.failures
+    assert (dst / "two.bin").read_bytes() == b"2" * 1000
+
+
+def test_recorded_but_modified_target_is_recopied(tmp_path):
+    """记账过、但目标端那份后来被改动过 → 必须重新复制。
+
+    时间戳要显式挪开，不能靠「刚写过所以时间戳一定变了」：写入的 mtime 取自系统
+    时钟，而 Windows 的时钟节拍约 15ms，源文件与这次写入落在同一刻度里时两边会
+    精确相等，跳过判定成立、测试假通过。
+    """
+    src, external = _tree(tmp_path)
+    dst = tmp_path / "dst"
+    plan = scanner.scan(src, dst)
+    sess = Session.create(src, dst, root=tmp_path / "sessions")
+    copier.run(plan, sess)
+
+    modified = dst / "two.bin"
+    modified.write_bytes(b"9" * 1000)                 # 同大小，内容变了
+    stamp = os.stat(src / "two.bin").st_mtime + 60    # 时间戳也明确不同
+    os.utime(modified, (stamp, stamp))
+
+    resumed = Session.load(sess.path)
+    result = copier.run(plan, resumed)
+    assert (dst / "two.bin").read_bytes() == b"2" * 1000
+    assert result.skipped == 1                        # 只有 a/one.txt 被跳过
+
+
+def test_non_link_reparse_file_is_copied_verbatim(tmp_path, make_reparse_file,
+                                                  raw_reparse_buffer):
+    """A3：读不动的重解析点原样搬过去，逐字节一致。"""
+    src = tmp_path / "src"
+    (src / "sub").mkdir(parents=True)
+    make_reparse_file(src / "sub" / "app.exe")
+    dst = tmp_path / "dst"
+    plan = scanner.scan(src, dst)
+    assert plan.totals.files == 1
+    sess = Session.create(src, dst, root=tmp_path / "sessions")
+    result = copier.run(plan, sess)
+    assert not result.failures
+    assert reparse.read_raw(dst / "sub" / "app.exe") == raw_reparse_buffer(
+        0x8000001B)
+
+
+def test_non_link_reparse_dir_is_copied(tmp_path, make_reparse_file):
+    """目录形态的非链接重解析点只会出现在 dirs 里，也必须被搬过去。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    make_reparse_file(src / "container", is_dir=True)
+    dst = tmp_path / "dst"
+    plan = scanner.scan(src, dst)
+    sess = Session.create(src, dst, root=tmp_path / "sessions")
+    result = copier.run(plan, sess)
+    assert not result.failures
+    st = os.lstat(dst / "container")
+    assert getattr(st, "st_reparse_tag", 0) == 0x8000001B
+
+
+def test_skip_unknown_reparse_leaves_it_out(tmp_path, make_reparse_file):
+    """显式跳过时既不计数也不复制，但清单里仍要列明。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    make_reparse_file(src / "app.exe")
+    (src / "real.txt").write_text("x", encoding="utf-8")
+    dst = tmp_path / "dst"
+    plan = scanner.scan(src, dst, skip_unknown_reparse=True)
+    assert plan.totals.files == 1
+    sess = Session.create(src, dst, root=tmp_path / "sessions")
+    result = copier.run(plan, sess)
+    assert not result.failures
+    assert not (dst / "app.exe").exists()
+    assert (dst / "real.txt").read_text(encoding="utf-8") == "x"
+
+
+def test_vanishing_directory_does_not_crash_the_run(tmp_path, monkeypatch):
+    """B3 顺带加固：遍历途中目录被别的进程删掉，不该让整个任务崩掉。"""
+    src, external = _tree(tmp_path)
+    dst = tmp_path / "dst"
+    plan = scanner.scan(src, dst)
+    sess = Session.create(src, dst, root=tmp_path / "sessions")
+    real_lstat = os.lstat
+
+    def flaky(path, *args, **kwargs):
+        if os.path.basename(str(path)) == "a":
+            raise FileNotFoundError(2, "系统找不到指定的文件。", str(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", flaky)
+    result = copier.run(plan, sess)          # 不得抛异常
+    assert result.copied_files == 1          # a/one.txt 随目录一起消失
+
+
+def test_fatal_reason_maps_unrecoverable_errors():
+    """B2：只有「重试也不会好转」的错误才算致命，普通拒绝访问不算。"""
+    assert copier.fatal_reason(OSError(28, "磁盘空间不足", None, 112)) == "disk_full"
+    assert copier.fatal_reason(OSError(0, "磁盘已满", None, 39)) == "disk_full"
+    assert copier.fatal_reason(OSError(22, "客户端没有所需的特权", None, 1314)) \
+        == "symlink_privilege"
+    # 只带 errno（配额耗尽等路径）也要认出来
+    assert copier.fatal_reason(OSError(errno.ENOSPC, "no space left")) == "disk_full"
+    # 拒绝访问是可以通过关掉程序/提权恢复的，绝不能因此中止整趟
+    assert copier.fatal_reason(OSError(13, "拒绝访问", None, 5)) == ""
+
+
+def test_disk_full_aborts_whole_run_without_retrying(tmp_path, monkeypatch):
+    """B2：磁盘写满必须立刻停，不能把剩下的文件逐个重试 14 秒。
+
+    10 万个文件按 1+3+10 秒重试要耗 389 小时才失败完，而每一条失败都还要
+    往已经满了的盘上再写一遍。
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    for index in range(6):
+        (src / f"f{index}.bin").write_bytes(b"x" * 100)
+    dst = tmp_path / "dst"
+    plan = scanner.scan(src, dst)
+    sess = Session.create(src, dst, root=tmp_path / "sessions")
+
+    def full(*args, **kwargs):
+        raise OSError(28, "磁盘空间不足", None, 112)
+
+    monkeypatch.setattr(copier, "copy_one", full)
+    started = time.monotonic()
+    result = copier.run(plan, sess)          # 默认重试间隔是 1/3/10 秒
+    elapsed = time.monotonic() - started
+
+    assert result.aborted == "disk_full"
+    assert len(result.failures) == 1, "整趟只该记一条致命失败，而不是每个文件一条"
+    assert result.failures[0].reason == "disk_full"
+    assert result.copied_files == 0
+    assert elapsed < 1.0, f"致命错误竟然还在重试，耗时 {elapsed:.1f}s"
+    assert sess.phase == "aborted"
+    assert sess.failed_rels() == {"f0.bin"} or len(sess.failed_rels()) == 1
+
+
+def test_symlink_privilege_failure_aborts_immediately(tmp_path, monkeypatch):
+    """B2/B4：建链缺特权（WinError 1314）同样整趟中止，不逐条失败。"""
+    src, external = _tree(tmp_path)
+    dst = tmp_path / "dst"
+    plan = scanner.scan(src, dst)
+    sess = Session.create(src, dst, root=tmp_path / "sessions")
+
+    def denied(*args, **kwargs):
+        raise OSError(22, "客户端没有所需的特权", None, 1314)
+
+    monkeypatch.setattr(copier.linker, "create", denied)
+    result = copier.run(plan, sess)
+    assert result.aborted == "symlink_privilege"
+    assert len(result.failures) == 1
+    assert sess.phase == "aborted"
+
+
+def test_links_are_created_before_bulk_copy(tmp_path, monkeypatch):
+    """B4：链接重建排在批量复制之前，权限/ACL 问题几秒内就暴露。
+
+    让每个文件的复制都失败，链接依然必须已经建好——原来链接是第 3 趟，
+    几十万个文件复制完才轮到它，权限错误要等几小时才看得见。
+    """
+    src, external = _tree(tmp_path)
+    dst = tmp_path / "dst"
+    plan = scanner.scan(src, dst)
+    sess = Session.create(src, dst, root=tmp_path / "sessions")
+
+    def denied(*args, **kwargs):
+        raise OSError(13, "拒绝访问", None, 5)
+
+    monkeypatch.setattr(copier, "copy_one", denied)
+    result = copier.run(plan, sess, retry_delays=(0.0, 0.0))
+
+    assert result.copied_files == 0
+    assert result.aborted == "", "普通拒绝访问不该中止整趟"
+    link = dst / "link-pkg"
+    assert os.lstat(link).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    assert sess.links and sess.links[0]["rel"] == "link-pkg"
+
+
+# --- C6：续传第二趟会再走一遍建链 -----------------------------------
+def test_second_pass_leaves_a_correct_link_alone(tmp_path, monkeypatch):
+    """已经指对的链接不能被拆了重建。
+
+    删掉之后万一建不回来（缺特权、目标盘出问题），一条本来好好的链接就没了；
+    而续传的每一趟都会把建链整批重走一遍，这不是边缘情况。
+    """
+    src, external = _tree(tmp_path)
+    moved = tmp_path / "moved"
+    dst = tmp_path / "dst"
+    mappings = {str(external): str(moved)}
+    first = Session.create(src, dst, root=tmp_path / "sessions")
+    assert not copier.run(scanner.scan(src, dst, mappings=mappings), first).failures
+
+    calls = []
+    monkeypatch.setattr(copier.linker, "create",
+                        lambda *a, **k: calls.append(a) or "junction")
+    second = Session.create(src, dst, root=tmp_path / "sessions")
+    result = copier.run(scanner.scan(src, dst, mappings=mappings), second)
+
+    assert calls == []
+    assert not result.failures
+    # 记录照样要补上：会话里的 links 是报告与回滚的依据，不能因为跳过就缺项
+    assert second.links[0]["rel"] == "link-pkg"
+    assert second.links[0]["kind"] == "junction"
+    assert second.links[0]["new_target"] == str(moved)
+
+
+def test_second_pass_replaces_a_dangling_link(tmp_path):
+    """目标端已有一条**指向不存在位置**的链接时必须换掉，而不是撞 WinError 183。
+
+    这种链接 `os.path.exists` 报 False，原来那套跟着链接走的「已存在」判定
+    整个漏掉它，紧接着 os.mkdir 就失败——续传死在一条早就建好的链接上。
+    """
+    src, external = _tree(tmp_path)
+    dst = tmp_path / "dst"
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    (moved / "marker.txt").write_text("new", encoding="utf-8")
+    dst.mkdir()
+    reparse.create_junction(dst / "link-pkg", tmp_path / "gone")
+    assert not os.path.exists(dst / "link-pkg")
+
+    plan = scanner.scan(src, dst, mappings={str(external): str(moved)})
+    sess = Session.create(src, dst, root=tmp_path / "sessions")
+    result = copier.run(plan, sess)
+
+    assert not result.failures
+    assert (dst / "link-pkg" / "marker.txt").read_text(encoding="utf-8") == "new"
+
+
+def test_second_pass_replaces_a_link_pointing_somewhere_else(tmp_path):
+    """上一趟没有映射、这一趟有：指错位置的链接要按新计划重建。"""
+    src, external = _tree(tmp_path)
+    dst = tmp_path / "dst"
+    first = Session.create(src, dst, root=tmp_path / "sessions")
+    assert not copier.run(scanner.scan(src, dst), first).failures
+    assert (dst / "link-pkg" / "index.js").read_text(encoding="utf-8") == "js"
+
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    (moved / "marker.txt").write_text("new", encoding="utf-8")
+    second = Session.create(src, dst, root=tmp_path / "sessions")
+    result = copier.run(scanner.scan(src, dst, mappings={str(external): str(moved)}),
+                        second)
+
+    assert not result.failures
+    assert (dst / "link-pkg" / "marker.txt").read_text(encoding="utf-8") == "new"
+    assert not (dst / "link-pkg" / "index.js").exists()
+
+
+# --- C9：目录时间戳 ---------------------------------------------------
+def test_directory_timestamps_are_copied(tmp_path):
+    """文件一直走 copystat，目录此前完全没管。
+
+    目标端目录的 mtime 全是「刚刚」，依赖目录时间戳做增量同步或
+    构建缓存失效判断的工具会把整棵树当成新内容重扫一遍。
+    """
+    src = tmp_path / "src"
+    deep = src / "a" / "b"
+    deep.mkdir(parents=True)
+    (deep / "f.txt").write_text("x", encoding="utf-8")
+    old = 1_000_000_000                     # 2001-09-09，绝不会与「刚刚」混淆
+    # 自深向浅设置，否则给上层写时间戳会把刚设好的下层值顶掉
+    for level in (deep, src / "a", src):
+        os.utime(level, (old, old))
+
+    dst, result, sess = _run(tmp_path, src)
+
+    assert not result.failures
+    assert result.dir_times_failed == []
+    for rel in (".", "a", os.path.join("a", "b")):
+        src_dir = src if rel == "." else src / rel
+        dst_dir = dst if rel == "." else dst / rel
+        assert int(os.stat(dst_dir).st_mtime) == old, rel
+        # 精确一致：copystat 按 ns 写回，NTFS 存 100ns 刻度
+        assert os.stat(dst_dir).st_mtime == os.stat(src_dir).st_mtime, rel
+
+
+# --- C4：排除目录 -----------------------------------------------------
+def test_excluded_subtree_is_not_copied(tmp_path):
+    """被排除的目录连目标端的目录项都不建：用户排除的就是「不要碰这些」。"""
+    src = tmp_path / "src"
+    (src / "keep").mkdir(parents=True)
+    (src / "keep" / "a.txt").write_text("a", encoding="utf-8")
+    (src / "junk").mkdir()
+    (src / "junk" / "big.bin").write_bytes(b"x" * 5000)
+
+    dst = tmp_path / "dst"
+    plan = scanner.scan(src, dst, excludes=[str(src / "junk")])
+    result = copier.run(plan, Session.create(src, dst, root=tmp_path / "sessions"))
+
+    assert not result.failures
+    assert (dst / "keep" / "a.txt").read_text(encoding="utf-8") == "a"
+    assert not (dst / "junk").exists()
+    assert result.copied_files == 1

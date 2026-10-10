@@ -98,3 +98,39 @@ def test_set_running_disables_controls(page):
     assert page.cancel_button.isEnabled() is False
     page.set_running(True)
     assert page.pause_button.isEnabled() is True
+
+
+def test_copying_phase_is_labelled(page):
+    page.update_progress(Progress(phase="copying", done_files=1, total_files=10))
+    assert page.count_label.text().startswith("复制中")
+    assert page.log.toPlainText() == ""
+
+
+def test_verifying_phase_shows_progress_and_logs_once(page):
+    """B6：校验阶段原来既没进度也没日志，几十万文件时界面像卡死了。"""
+    page.update_progress(Progress(phase="verifying", done_files=2, total_files=10,
+                                  done_bytes=20, total_bytes=100))
+    assert page.count_label.text().startswith("校验中")
+    assert "2 / 10" in page.count_label.text()
+    assert page.percent() == 20
+    assert page.log.toPlainText().count("[校验] 开始比对源与目标") == 1
+
+    page.update_progress(Progress(phase="verifying", done_files=7, total_files=10,
+                                  done_bytes=70, total_bytes=100))
+    assert "7 / 10" in page.count_label.text()
+    assert page.log.toPlainText().count("[校验]") == 1, "同一阶段不该反复记日志"
+
+
+def test_reset_forgets_phase_so_next_run_logs_again(page):
+    page.update_progress(Progress(phase="verifying", done_files=1, total_files=2))
+    page.reset()
+    page.update_progress(Progress(phase="verifying", done_files=1, total_files=2))
+    assert page.log.toPlainText().count("[校验]") == 1
+
+
+def test_fatal_reasons_have_readable_text(page):
+    """B2/B4：磁盘满与缺符号链接特权必须能看懂，不能把内部键名甩给用户。"""
+    page.add_failure(CopyFailure(rel="big.bin", reason="disk_full"))
+    page.add_failure(CopyFailure(rel="link", reason="symlink_privilege"))
+    assert page.failure_rows() == [("big.bin", "目标卷空间不足", ""),
+                                   ("link", "缺符号链接特权", "")]

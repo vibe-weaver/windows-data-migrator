@@ -4,6 +4,7 @@ import pytest
 from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
 from PySide6.QtGui import QDropEvent
 
+from dmig.ui import select_page
 from dmig.ui.select_page import PathLineEdit, SelectPage, free_space_text
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows")
@@ -24,15 +25,31 @@ def test_missing_source_blocks(page, tmp_path):
     assert "不存在" in page.issues_text()
 
 
-def test_valid_pair_passes(page, tmp_path):
+def test_same_volume_pair_is_flagged_but_not_blocked(page, tmp_path):
+    """同盘迁移不释放空间，必须说出来；但用户可能确实只想换个目录，不能拦死。"""
     source = tmp_path / "a"
     source.mkdir()
     page.set_source(str(source))
     page.set_target(str(tmp_path / "b"))
     page.refresh_check()
     assert page.has_blocking_error() is False
+    assert "same_volume" in {i.code for i in page.issues()}
+    assert "[提示] 源与目标在同一个卷" in page.issues_text()
+
+
+def test_clean_pair_shows_the_pass_hint(page, tmp_path, monkeypatch):
+    """一条问题都没有时要给绿色结论，而不是留一片空白。"""
+    monkeypatch.setattr(select_page.guard, "check", lambda *a, **kw: [])
+    source = tmp_path / "a"
+    source.mkdir()
+    page.set_source(str(source))
+    page.set_target(str(tmp_path / "b"))
+    page.refresh_check()
+    assert page.has_blocking_error() is False
+    assert page.issues() == []
     assert "前置校验通过" in page.issues_text()
-    assert [i.code for i in page.issues()] == []
+    assert not page._check_hint.isVisibleTo(page)
+    assert page._check_pass.isVisibleTo(page)
 
 
 def test_identical_paths_block(page, tmp_path):

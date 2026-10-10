@@ -12,12 +12,12 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QHBoxLayout, QHeaderView, QTableWidgetItem,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QHBoxLayout, QHeaderView, QListWidgetItem,
+                               QTableWidgetItem, QVBoxLayout, QWidget)
 
 import qfluentwidgets as qf
 
-from ..core.models import MigrationPlan
+from ..core.models import MigrationPlan, lossy_attribute_text
 from . import chrome
 from .format import estimate_seconds, human_bytes, human_duration
 from .theme import MUTED
@@ -60,12 +60,23 @@ def _card(title: str) -> tuple[chrome.Card, QVBoxLayout]:
 class PlanPage(QWidget):
     """② 计划页。"""
 
-    mappings_applied = Signal()
+    replan_requested = Signal()
     elevate_requested = Signal()
+    takeover_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._plan: MigrationPlan | None = None
+        # 用户映射意图的权威存储，跨 load() 存活。
+        # 只靠表格单元格记不住：重扫会按新计划重建表格，用户刚填的值会被清空，
+        # 随后 start_migration 拿到空映射、用空映射重建 Migrator，映射就彻底丢了。
+        self._mappings: dict[str, str] = {}
+        # 本次要跳过的目录（绝对路径），同样跨 load() 存活。
+        # 只靠计划回显会丢：重扫之后新计划里那些目录已经不在 permission_issues 里了，
+        # 下一次重建 Migrator 就成了空排除项，被跳过的目录会被重新复制。
+        self._excludes: list[str] = []
+        self._loading = False
+        self._symlink_blocked = False
 
         # 大数字由 MetricRow 负责排版；值标签在这里先建好并**指定 parent**，
         # 再交给 MetricRow 接管——必须是 MetricRow 的子控件：交给 `addLayout`
@@ -111,17 +122,28 @@ class PlanPage(QWidget):
         self.unknown_list.setMinimumHeight(56)
         self.unknown_list.setMaximumHeight(132)
 
-        self.deep_check = qf.CheckBox("启用 SHA256 全量校验（较慢，但能发现同大小不同内容）")
+        self.deep_check = qf.CheckBox(
+            "启用 SHA256 全量校验（较慢；默认已比对大小与时间戳，"
+            "哈希能进一步发现两者都相同但内容已损坏的文件）")
+        self.skip_reparse_check = qf.CheckBox(
+            "跳过下列条目，不按真实内容复制（只保留在备份里）")
+        self.skip_denied_check = qf.CheckBox(
+            "跳过无权限访问的目录（它们只保留在备份里，删备份前请确认不再需要）")
         self.apply_button = qf.PrimaryPushButton("应用映射并重新扫描")
         self.elevate_button = qf.PushButton("以管理员身份重试")
         self.elevate_button.setEnabled(False)
+        self.takeover_button = qf.PushButton("接管这些目录的权限")
+        self.takeover_button.setEnabled(False)
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.apply_button)
         buttons.addWidget(self.elevate_button)
+        buttons.addWidget(self.takeover_button)
         buttons.addStretch(1)
 
-        unknown_card, unknown_layout = _card("未知重解析点（不会被复制）")
+        unknown_card, unknown_layout = _card(
+            "非链接类重解析点（云占位符 / AppExecLink / Dedup 等，默认按真实内容复制）")
+        unknown_layout.addWidget(self.skip_reparse_check)
         unknown_layout.addWidget(self.unknown_list)
 
         groups_card, groups_layout = _card("链接目标归属表")
@@ -135,14 +157,45 @@ class PlanPage(QWidget):
         layout.addWidget(warn_card)
         layout.addWidget(groups_card, 1)
         layout.addWidget(unknown_card)
+        layout.addWidget(self.skip_denied_check)
         layout.addWidget(self.deep_check)
         layout.addLayout(buttons)
 
-        self.apply_button.clicked.connect(self.mappings_applied.emit)
+        self.apply_button.clicked.connect(self.replan_requested.emit)
         self.elevate_button.clicked.connect(self.elevate_requested.emit)
+        self.takeover_button.clicked.connect(self.takeover_requested.emit)
+        self.group_table.itemChanged.connect(self._on_group_item_changed)
+        # 跳过与否会改变真实数据量与复制行为，必须重扫，
+        # 否则页面显示的计划与实际执行的不一致。
+        self.skip_reparse_check.toggled.connect(self._on_skip_toggled)
+        self.skip_denied_check.toggled.connect(self._on_skip_toggled)
 
     # --- 对外接口 ---------------------------------------------------
-    def load(self, plan: MigrationPlan, *, already_elevated: bool = False) -> None:
+    def set_options(self, options: dict) -> None:
+        """续传：把会话记录的运行参数回显到页面上。
+
+        映射要直接落进 `_mappings`：调用时表格还没有行（计划尚未扫描），
+        只填单元格等于什么都没填；而 `_mappings` 是跨 `load()` 的权威存储，
+        随后扫描出的分组会照它回显。
+
+        `setChecked` 会触发 toggled → 请求重扫，本方法又是在窗口构造期间被调的，
+        那次重扫会打在还没填源/目标的页面上，所以整段放进 `_loading` 保护区间。
+        """
+        options = options or {}
+        self._loading = True
+        try:
+            for prefix, target in (options.get("mappings") or {}).items():
+                self._remember_mapping(str(prefix), str(target))
+            self._excludes = [str(p) for p in (options.get("excludes") or [])]
+            self.skip_denied_check.setChecked(bool(self._excludes))
+            self.deep_check.setChecked(bool(options.get("deep_verify")))
+            self.skip_reparse_check.setChecked(
+                bool(options.get("skip_unknown_reparse")))
+        finally:
+            self._loading = False
+
+    def load(self, plan: MigrationPlan, *, already_elevated: bool = False,
+             symlink_capable: bool = True) -> None:
         self._plan = plan
         totals = plan.totals
         # 走 MetricRow.set_value 而不是直接 setText：
@@ -167,63 +220,193 @@ class PlanPage(QWidget):
             outside = sum(group.count for group in plan.link_groups)
             lines.append(f"{outside} 个链接指向源树之外；若那些目录也要迁移，"
                          "请在下方为每个目标目录填写重写后的新路径。")
+        dangling = [link for link in plan.links if link.is_dangling]
+        if dangling:
+            shown = "、".join(link.rel for link in dangling[:3])
+            if len(dangling) > 3:
+                shown += "…"
+            lines.append(f"{len(dangling)} 条链接的目标现在就不存在（断链）：{shown}。"
+                         "仍会原样重建，迁移后照样指不到东西。")
+        lossy = lossy_attribute_text(plan.sparse_files, plan.hardlinked_files,
+                                     plan.ads_files)
+        if lossy:
+            lines.append(f"复制方式的固有限制：{lossy}。")
         if plan.permission_issues:
             if already_elevated:
                 lines.append(f"{len(plan.permission_issues)} 个目录即使提权也访问不了，"
-                             "请检查这些路径是否存在或已被占用。")
+                             "请检查这些路径是否存在或已被占用；"
+                             "确实拿不到权限的，勾选下方「跳过无权限访问的目录」把它们排除掉。")
             else:
                 lines.append(f"{len(plan.permission_issues)} 个目录无权限访问，"
-                             "请点「以管理员身份重试」。")
+                             "请点「以管理员身份重试」；"
+                             "确实拿不到权限的，勾选下方「跳过无权限访问的目录」把它们排除掉。")
+        if plan.excluded:
+            shown = "、".join(plan.excluded[:3])
+            if len(plan.excluded) > 3:
+                shown += "…"
+            lines.append(f"已跳过 {len(plan.excluded)} 项（{shown}）："
+                         "它们不会复制到目标，只存在于备份里。")
+        self._symlink_blocked = bool(plan.file_symlinks) and not symlink_capable
+        if self._symlink_blocked:
+            if already_elevated:
+                lines.append(f"{plan.file_symlinks} 个文件符号链接即使提权也建不起来，"
+                             "请开启 Windows 开发者模式，或检查组策略里"
+                             "「创建符号链接」权限有没有授予当前用户。")
+            else:
+                lines.append(f"{plan.file_symlinks} 个文件符号链接需要管理员特权才能重建"
+                             "（目录链接会降级为 junction，不受影响）。"
+                             "现在不处理，等到复制完才会失败——请点「以管理员身份重试」，"
+                             "或开启 Windows 开发者模式。")
         if plan.unknown_reparse:
-            lines.append(f"{len(plan.unknown_reparse)} 个未知重解析点不会被复制。")
+            if plan.skip_unknown_reparse:
+                lines.append(f"{len(plan.unknown_reparse)} 个非链接类重解析点将被跳过，"
+                             "它们只存在于备份中——删除备份前请确认不再需要。")
+            else:
+                lines.append(f"{len(plan.unknown_reparse)} 个非链接类重解析点将按真实内容"
+                             "复制（云占位符会触发下载，可能很慢）。")
         if plan.target_not_empty:
             lines.append("提示：目标目录已存在且非空，将按续传/合并处理。")
         self.warn_label.setText("\n".join(lines))
 
-        self.group_table.setRowCount(0)
-        for group in plan.link_groups:
-            row = self.group_table.rowCount()
-            self.group_table.insertRow(row)
-            prefix_item = QTableWidgetItem(group.prefix)
-            prefix_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            # 路径很长仍有被截断的可能，挂上 tooltip 保证全文可见
-            prefix_item.setToolTip(group.prefix)
-            self.group_table.setItem(row, 0, prefix_item)
-            count_item = QTableWidgetItem(str(group.count))
-            count_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            count_item.setToolTip(str(group.count))
-            self.group_table.setItem(row, 1, count_item)
-            mapping_item = QTableWidgetItem(group.mapped_to or "")
-            mapping_item.setToolTip(group.mapped_to or "")
-            self.group_table.setItem(row, 2, mapping_item)
+        self._loading = True
+        try:
+            self.group_table.setRowCount(0)
+            for group in plan.link_groups:
+                row = self.group_table.rowCount()
+                self.group_table.insertRow(row)
+                prefix_item = QTableWidgetItem(group.prefix)
+                prefix_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                # 路径很长仍有被截断的可能，挂上 tooltip 保证全文可见
+                prefix_item.setToolTip(group.prefix)
+                self.group_table.setItem(row, 0, prefix_item)
+                count_item = QTableWidgetItem(str(group.count))
+                count_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                count_item.setToolTip(str(group.count))
+                self.group_table.setItem(row, 1, count_item)
+                # 计划回传的 mapped_to 优先；计划里没有就用页面自己记住的，
+                # 否则用户填一次、重扫一次就被清空，映射随之丢失。
+                mapped = group.mapped_to or self._mappings.get(group.prefix, "")
+                mapping_item = QTableWidgetItem(mapped)
+                mapping_item.setToolTip(mapped)
+                self.group_table.setItem(row, 2, mapping_item)
+            # setChecked 会触发 toggled，必须在 _loading 保护区间内回显，
+            # 否则每次 load() 都会多请求一次重扫。
+            self.skip_reparse_check.setChecked(plan.skip_unknown_reparse)
+            # 清单为空时勾选毫无意义，却会白白触发一次重扫
+            self.skip_reparse_check.setEnabled(bool(plan.unknown_reparse))
+
+            # 新计划里那些目录已经不在 permission_issues 里了，必须靠计划本身
+            # 与页面的记忆把排除项续上，否则下一次重建 Migrator 就成了空排除项。
+            self._excludes = sorted(set(self._excludes) | set(plan.excludes))
+            self.skip_denied_check.setChecked(bool(self._excludes))
+            self.skip_denied_check.setEnabled(
+                bool(plan.permission_issues) or bool(self._excludes))
+        finally:
+            self._loading = False
 
         self.unknown_list.clear()
-        for rel in plan.unknown_reparse:
-            self.unknown_list.addItem(rel)
+        for entry in plan.unknown_reparse:
+            item = QListWidgetItem(entry.rel)
+            item.setToolTip(f"重解析标签 0x{entry.tag:08X}，"
+                            f"{'目录' if entry.is_dir else '文件'}")
+            self.unknown_list.addItem(item)
 
-        self.elevate_button.setEnabled(bool(plan.permission_issues) and not already_elevated)
+        self.elevate_button.setEnabled(
+            (bool(plan.permission_issues) or self._symlink_blocked) and not already_elevated)
         if already_elevated:
             self.elevate_button.setToolTip("当前进程已具备管理员权限，无需再次提权")
+        elif self._symlink_blocked and not plan.permission_issues:
+            self.elevate_button.setToolTip("重建文件符号链接需要管理员特权")
         else:
             self.elevate_button.setToolTip("")
 
+        # 接管属主要求提权：未提权时按钮不可用，提示直接说清要先做什么。
+        self.takeover_button.setEnabled(bool(plan.permission_issues) and already_elevated)
+        if not already_elevated:
+            self.takeover_button.setToolTip("接管属主需要管理员权限，请先点「以管理员身份重试」")
+        elif not plan.permission_issues:
+            self.takeover_button.setToolTip("当前没有无权限访问的目录")
+        else:
+            self.takeover_button.setToolTip(
+                "先把原始 ACL 记进会话，再接管属主并授予当前用户完全控制；"
+                "回滚时按记录还原。原始 ACL 读不到的那些会如实告知，不会静默改动")
+
     def mappings(self) -> dict[str, str]:
-        """只收集真正改动过的映射；留空或与源相同的都视为恒等。"""
+        """用户当前的全部重写映射；留空或与源相同的都视为恒等。
+
+        表格里的行优先（留空 = 明确取消），此外还要带上「行已经不在了、
+        但用户填过的映射」：重扫后分组可能变化，只读表格会把它们弄丢。
+        """
         result: dict[str, str] = {}
+        listed: set[str] = set()
         for row in range(self.group_table.rowCount()):
             source_item = self.group_table.item(row, 0)
             target_item = self.group_table.item(row, 2)
             if source_item is None or target_item is None:
                 continue
             source = source_item.text().strip()
+            if not source:
+                continue
+            listed.add(source)
             target = target_item.text().strip()
-            if not source or not target:
+            if not target:
                 continue
             if os.path.normcase(os.path.normpath(target)) == \
                     os.path.normcase(os.path.normpath(source)):
                 continue
             result[source] = target
+        for source, target in self._mappings.items():
+            if source not in listed and target:
+                result[source] = target
         return result
+
+    def excludes(self) -> list[str]:
+        """本次要跳过的目录（绝对路径）。
+
+        值全部来自 `_excludes`：它由勾选动作固化、由 `set_options` 从会话恢复，
+        跨 `load()` 存活。不按当前计划的 permission_issues 现推——重扫之后
+        新计划里那些目录已经因为被排除而不再出现，现推会整批丢掉。
+        """
+        return sorted(set(self._excludes))
+
+    def _remember_mapping(self, prefix: str, value: str) -> None:
+        if not prefix:
+            return
+        if not value or os.path.normcase(os.path.normpath(value)) == \
+                os.path.normcase(os.path.normpath(prefix)):
+            self._mappings.pop(prefix, None)      # 留空或填回原样都算取消
+        else:
+            self._mappings[prefix] = value
+
+    def _on_group_item_changed(self, item) -> None:
+        """用户直接在「重写为」单元格里打字时也要记住，否则重扫后照样丢。"""
+        if self._loading or item.column() != 2:
+            return
+        prefix_item = self.group_table.item(item.row(), 0)
+        if prefix_item is not None:
+            self._remember_mapping(prefix_item.text().strip(), item.text().strip())
+
+    def _on_skip_toggled(self, _checked: bool) -> None:
+        if self._loading:
+            return
+        self._sync_excludes()
+        self.replan_requested.emit()
+
+    def _sync_excludes(self) -> None:
+        """把勾选状态落到 `_excludes` 上。
+
+        勾上时把当前这份无权限清单固化下来，取消时清空。必须固化而不是每次现推：
+        重扫之后新计划里那些目录已经因为被排除而不再出现在 permission_issues 中，
+        现推会在下一次 `load()` 时把它们整批丢掉。
+        """
+        if not self.skip_denied_check.isChecked():
+            self._excludes = []
+            return
+        denied = set(self._plan.permission_issues) if self._plan else set()
+        self._excludes = sorted(set(self._excludes) | denied)
+
+    def skip_unknown_reparse(self) -> bool:
+        return self.skip_reparse_check.isChecked()
 
     def group_rows(self) -> list[tuple[str, int, str]]:
         rows: list[tuple[str, int, str]] = []
@@ -239,6 +422,9 @@ class PlanPage(QWidget):
             item.setText(mapped_to)
             # tooltip 同步，否则改完映射后悬停看到的还是旧值
             item.setToolTip(mapped_to)
+        prefix_item = self.group_table.item(row, 0)
+        if prefix_item is not None:
+            self._remember_mapping(prefix_item.text().strip(), mapped_to.strip())
 
     def metric_text(self, key: str) -> str:
         """读取某个指标的文本。

@@ -3,9 +3,11 @@ import io
 import sys
 
 import pytest
+from PySide6.QtGui import QColor
 
 from dmig.core.models import CopyFailure, CopyResult, VerifyResult
 from dmig.core.migrator import MigrateOutcome
+from dmig.ui import theme
 from dmig.ui.report_page import ReportPage
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows")
@@ -88,3 +90,92 @@ def test_reverify_signal(page, qtbot):
     page.load(_outcome())
     with qtbot.waitSignal(page.reverify_requested, timeout=2000):
         page.reverify_button.click()
+
+
+def test_discard_enabled_only_for_partial_target(page):
+    """B1 的出口：源完好、目标半份时可清；已成功或已改名时不可清。"""
+    page.load(_outcome(backup_path=None))
+    assert page.discard_button.isEnabled() is True
+
+    page.load(_outcome())                     # 有备份 = 已经改过名
+    assert page.discard_button.isEnabled() is False
+
+    page.load(_outcome(ok=True, phase="done"))
+    assert page.discard_button.isEnabled() is False
+
+
+def test_discard_button_emits_signal(page, qtbot):
+    page.load(_outcome(backup_path=None))
+    with qtbot.waitSignal(page.discard_requested, timeout=2000):
+        page.discard_button.click()
+
+
+def test_fatal_reasons_are_translated(page):
+    """磁盘写满这类中止原因不能直接把英文代号甩给用户。"""
+    page.load(_outcome(
+        phase="aborted", backup_path=None,
+        copy=CopyResult(copied_files=0, failures=[
+            CopyFailure(rel="big.bin", reason="disk_full")]),
+        message="目标卷空间不足，已立即停止"))
+    assert page.rows()[0] == ["未复制", "big.bin", "目标卷空间不足", ""]
+
+
+# --- C5：断链在报告里标红 ---------------------------------------------
+
+_DANGLING_LINKS = [
+    {"rel": "gone", "kind": "junction", "raw_target": "D:\\vanished",
+     "new_target": "D:\\vanished", "is_dangling": True},
+]
+
+
+def test_dangling_row_is_painted_red(page):
+    """断链不标红的话，用户会以为是迁移把链接弄坏了。"""
+    page.load(_outcome(links=_DANGLING_LINKS))
+    rows = page.rows()
+    assert rows[-1][0] == "断链"
+    index = len(rows) - 1
+    assert page.table.item(index, 0).foreground().color() == \
+        QColor(theme.error_color())
+    # 完整指向挂在 tooltip 上：表格里只放结论，免得把「相对路径」列挤没
+    assert "D:\\vanished" in page.table.item(index, 1).toolTip()
+
+
+def test_dangling_count_is_a_stat(page):
+    page.load(_outcome(links=_DANGLING_LINKS))
+    assert page.summary_text("dangling") == "1"
+
+
+def test_non_dangling_rows_keep_default_color(page):
+    page.load(_outcome())
+    assert page.table.item(0, 0).foreground().color() != \
+        QColor(theme.error_color())
+
+
+def test_dangling_links_reach_the_exported_csv(page, tmp_path):
+    page.load(_outcome(links=_DANGLING_LINKS))
+    target = tmp_path / "报告.csv"
+    page.export_csv(target)
+    text = target.read_text(encoding="utf-8-sig")
+    assert "断链" in text
+    assert "D:\\vanished" in text
+
+
+# --- C9：复制保不住的属性 ---------------------------------------------
+
+def test_lossy_attributes_get_a_row(page):
+    page.load(_outcome(hardlinked_files=482, ads_files=7))
+    rows = page.rows()
+    assert rows[-1][0] == "未保留属性"
+    assert "482 个硬链接" in rows[-1][2]
+    assert "7 个文件带附加数据流" in rows[-1][2]
+
+
+def test_nothing_lossy_means_no_extra_row(page):
+    page.load(_outcome())
+    assert all(row[0] != "未保留属性" for row in page.rows())
+
+
+def test_dir_time_failure_gets_a_row(page):
+    page.load(_outcome(copy=CopyResult(dir_times_failed=["a\\b"])))
+    assert ["目录时间戳", "a\\b", "目录时间戳未能写回，该目录会显示为迁移时刻", ""] \
+        in page.rows()

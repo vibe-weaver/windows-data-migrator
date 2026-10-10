@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from ctypes import wintypes
 
 
@@ -195,6 +197,39 @@ def restore_acl(path, sddl: str) -> bool:
         return bool(_adv.SetFileSecurityW(target, DACL_SECURITY_INFORMATION, sd))
     finally:
         _k32.LocalFree(sd)
+
+
+_SYMLINK_CAPABLE: bool | None = None
+
+
+def can_create_symlink() -> bool:
+    """当前进程能否创建符号链接。实测一次，结果按进程缓存。
+
+    不查注册表：开发者模式、组策略与 SeCreateSymbolicLinkPrivilege 的组合太多，
+    注册表只是代理指标。本机实测未提权且开发者模式关闭时，带不带
+    SYMLINK_UNPRIVILEGED_FLAG 全部失败于 WinError 1314，只有真建一次才算数。
+
+    只有**文件**符号链接必须靠它：目录符号链接可以降级成 junction（无需特权）。
+    """
+    global _SYMLINK_CAPABLE
+    if _SYMLINK_CAPABLE is not None:
+        return _SYMLINK_CAPABLE
+
+    from . import reparse
+
+    folder = tempfile.mkdtemp(prefix="dmig-symlink-probe-")
+    target = os.path.join(folder, "target")
+    link = os.path.join(folder, "link")
+    try:
+        with open(target, "wb"):
+            pass
+        reparse.create_symlink(link, target, False)
+        _SYMLINK_CAPABLE = True
+    except OSError:
+        _SYMLINK_CAPABLE = False
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    return _SYMLINK_CAPABLE
 
 
 def take_ownership(path) -> bool:

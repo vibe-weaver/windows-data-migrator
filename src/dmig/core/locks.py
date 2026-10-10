@@ -39,17 +39,20 @@ class ProcessInfo:
     pid: int
 
 
-def who_locks(path) -> list[ProcessInfo]:
-    """返回正在占用该路径的进程；无占用或查询失败返回空列表。"""
-    if _rm is None:
+RM_BATCH = 300
+
+
+def _query(paths: list[str]) -> list[ProcessInfo]:
+    """一个 RM 会话里查这批路径，返回占用它们的进程（无占用/失败返回空）。"""
+    if _rm is None or not paths:
         return []
     session = wintypes.DWORD(0)
     key = ctypes.create_unicode_buffer(CCH_RM_SESSION_KEY + 1)
     if _rm.RmStartSession(ctypes.byref(session), 0, key) != 0:
         return []
     try:
-        files = (wintypes.LPCWSTR * 1)(long_path(path))
-        if _rm.RmRegisterResources(session, 1, files, 0, None, 0, None) != 0:
+        files = (wintypes.LPCWSTR * len(paths))(*[long_path(p) for p in paths])
+        if _rm.RmRegisterResources(session, len(paths), files, 0, None, 0, None) != 0:
             return []
         needed = wintypes.UINT(0)
         count = wintypes.UINT(0)
@@ -68,3 +71,26 @@ def who_locks(path) -> list[ProcessInfo]:
                 for i in range(count.value)]
     finally:
         _rm.RmEndSession(session)
+
+
+def who_locks(path) -> list[ProcessInfo]:
+    """返回正在占用该路径的进程；无占用或查询失败返回空列表。"""
+    return _query([str(path)])
+
+
+def who_locks_many(paths, batch: int = RM_BATCH) -> list[ProcessInfo]:
+    """批量查占用，返回去重后的进程清单。
+
+    逐个查每个文件都要起一次 RM 会话（实测约 30ms），改名失败时要排查的往往是
+    整棵树里成百上千个文件；实测 300 个文件共用一个会话只要约 80ms。
+
+    RM 只回答「这批文件里有哪些被谁占用」，不做逐文件归属，所以这里返回并集：
+    改名失败要的正是「关掉哪些程序」这份清单。目录不进 RM——实测注册目录
+    查不到任何进程，调用方要排查目录就得把里面的文件传进来。
+    """
+    found: dict[tuple[str, int], ProcessInfo] = {}
+    items = [str(p) for p in paths]
+    for start in range(0, len(items), max(batch, 1)):
+        for proc in _query(items[start:start + max(batch, 1)]):
+            found.setdefault((proc.name, proc.pid), proc)
+    return list(found.values())

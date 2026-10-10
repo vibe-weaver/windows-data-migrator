@@ -1,11 +1,14 @@
 import os
+import subprocess
 import sys
 import stat as stat_mod
+import time
 
 import pytest
 
-from dmig.core import linker, reparse
+from dmig.core import copier, linker, migrator as migrator_mod, permission, reparse
 from dmig.core.migrator import Migrator
+from dmig.core.session import Session
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows")
 
@@ -55,13 +58,12 @@ def test_cleanup_backup_removes_it(tmp_path):
     assert not os.path.exists(out.backup_path)
 
 
-def test_rollback_restores_source(tmp_path, monkeypatch):
-    src, ext = _tree(tmp_path)
-    m = _migrator(tmp_path, src)
+def _break_source_link(monkeypatch, src):
+    """只让「给源路径建链接」这一步失败，其余链接照常建。
 
-    # 只让「给源路径建链接」这一步失败。
-    # 不能把 linker.create 整体打桩：copier 复用的是同一个 linker 模块，
-    # 整体打桩会连复制阶段的链接重建一起打掉，结果变成 copy_failed 而不是 link_failed。
+    不能把 linker.create 整体打桩：copier 复用的是同一个 linker 模块，
+    整体打桩会连复制阶段的链接重建一起打掉，结果变成 copy_failed 而不是 link_failed。
+    """
     real_create = linker.create
 
     def fail_only_for_source(link_path, target, is_dir, prefer_junction=True):
@@ -70,6 +72,13 @@ def test_rollback_restores_source(tmp_path, monkeypatch):
         return real_create(link_path, target, is_dir, prefer_junction)
 
     monkeypatch.setattr("dmig.core.linker.create", fail_only_for_source)
+    return real_create
+
+
+def test_rollback_restores_source(tmp_path, monkeypatch):
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    _break_source_link(monkeypatch, src)
     out = m.execute()
     assert out.ok is False
     assert out.phase == "link_failed"
@@ -149,3 +158,891 @@ def test_cleanup_backup_does_not_follow_junctions(tmp_path):
     # 外部仓库的真实数据必须分毫未动
     assert (external / "precious.txt").read_text(encoding="utf-8") == "不能丢的数据"
     assert (external / "sub" / "more.txt").read_text(encoding="utf-8") == "更多数据"
+
+
+def test_mapping_reaches_the_created_link(tmp_path):
+    """A1 端到端：带映射执行迁移，目标端链接必须指向映射后的位置。
+
+    修复前实测：计划阶段显示的重写目标是对的，执行时映射被丢掉，
+    junction 仍指向原始位置，用户以为搬走了其实没搬。
+    """
+    from dmig.core.fsutil import strip_long_prefix
+
+    src = tmp_path / "src"
+    src.mkdir()
+    outside = tmp_path / "outside_store"
+    outside.mkdir()
+    (outside / "pkg.dat").write_text("repo data", encoding="utf-8")
+    moved = tmp_path / "moved_store"
+    reparse.create_junction(src / "store", outside)
+
+    m = Migrator(src, tmp_path / "dst",
+                 mappings={str(outside): str(moved)},
+                 session_root=tmp_path / "sessions")
+    plan = m.plan_it()
+    assert plan.links[0].new_target == str(moved)
+    assert plan.link_groups[0].mapped_to == str(moved)
+
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+    actual = strip_long_prefix(os.readlink(str(tmp_path / "dst" / "store")))
+    assert os.path.normcase(actual.rstrip("\\")) == os.path.normcase(str(moved))
+
+
+def test_non_link_reparse_survives_full_migration(tmp_path, make_reparse_file,
+                                                  raw_reparse_buffer):
+    """A3 端到端：读不动的重解析点要跟着迁移走到目标端，而不是只留在备份里。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "real.txt").write_text("data", encoding="utf-8")
+    make_reparse_file(src / "app.exe")
+
+    m = Migrator(src, tmp_path / "dst", session_root=tmp_path / "sessions")
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+    assert reparse.read_raw(tmp_path / "dst" / "app.exe") == raw_reparse_buffer(
+        0x8000001B)
+    # 备份里那份也在，删备份才是安全的
+    assert os.path.exists(os.path.join(out.backup_path, "app.exe"))
+    assert m.cleanup_backup() is True
+
+
+def test_cleanup_backup_reports_leftovers(tmp_path, monkeypatch):
+    """A4：删不掉就必须如实回报，不能一边留着数据一边说「已删除」。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+    assert out.ok
+    real_unlink = os.unlink
+
+    def deny(path, *args, **kwargs):
+        # rmtree 传进来的是带 \?\ 前缀的路径，只能按文件名匹配
+        if os.path.basename(str(path)) == "two.bin":
+            raise PermissionError(13, "拒绝访问", str(path))
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", deny)
+    assert m.cleanup_backup() is False
+    assert m.cleanup_error
+    assert os.path.exists(out.backup_path)
+    assert m.session.phase != "cleaned"
+
+
+def test_cleanup_backup_refuses_when_reparse_skipped(tmp_path, make_reparse_file):
+    """A3/A4：被跳过的重解析点只存在于备份中，删备份前必须明确强制。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "real.txt").write_text("x", encoding="utf-8")
+    make_reparse_file(src / "app.exe")
+
+    m = Migrator(src, tmp_path / "dst", session_root=tmp_path / "sessions",
+                 skip_unknown_reparse=True)
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+    assert m.skipped_reparse_count() == 1
+
+    assert m.cleanup_backup() is False
+    assert "重解析点" in m.cleanup_error
+    assert os.path.exists(out.backup_path)
+    assert not os.path.exists(tmp_path / "dst" / "app.exe")
+
+    assert m.cleanup_backup(force=True) is True
+    assert not os.path.exists(out.backup_path)
+
+
+def test_cleanup_backup_handles_dir_shaped_reparse(tmp_path, make_reparse_file):
+    """A4：目录形态的重解析点会让 scandir 失败于 WinError 1920。
+
+    删备份必须照样删干净，并且不能把它误报成「删不掉的残留」。
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "real.txt").write_text("x", encoding="utf-8")
+    make_reparse_file(src / "container", is_dir=True)
+
+    m = Migrator(src, tmp_path / "dst", session_root=tmp_path / "sessions")
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+    assert m.cleanup_backup() is True
+    assert m.cleanup_error == ""
+    assert not os.path.exists(out.backup_path)
+
+
+_LOCK_CHILD = """
+import sys, time
+handle = open(sys.argv[1], 'rb+')
+print('HELD', flush=True)
+time.sleep(30)
+"""
+
+
+def test_rename_retries_transient_failure(tmp_path, monkeypatch):
+    """B1：改名冲突多半是瞬时的，退避重试就能过，不该一次失败就整趟报废。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    monkeypatch.setattr(migrator_mod, "RENAME_DELAYS", (0.0, 0.0))
+    real_rename = os.rename
+    attempts = {"n": 0}
+
+    def flaky_rename(a, b, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            raise PermissionError(13, "拒绝访问", str(a))
+        return real_rename(a, b, **kwargs)
+
+    monkeypatch.setattr(os, "rename", flaky_rename)
+    out = m.execute()
+    assert attempts["n"] == 3
+    assert out.ok is True, f"{out.phase} {out.message}"
+    assert out.backup_path and os.path.isdir(out.backup_path)
+
+
+def test_rename_failure_names_the_blocking_process(tmp_path, monkeypatch):
+    """B1：改名失败要告诉用户关掉哪个程序，而不是只甩一句 WinError 5。
+
+    子进程用普通 open() 持有 src/a/one.txt——共享读，复制照样成功，
+    但祖先目录改名会被拒（实测 WinError 5），正是真实现场。
+    """
+    src, ext = _tree(tmp_path)
+    (src / "a" / "one.txt").write_text("one", encoding="utf-8")
+    m = _migrator(tmp_path, src)
+    monkeypatch.setattr(migrator_mod, "RENAME_DELAYS", (0.01, 0.01))
+    child = subprocess.Popen([sys.executable, "-c", _LOCK_CHILD,
+                              str(src / "a" / "one.txt")],
+                             stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "HELD"
+        time.sleep(0.6)
+        out = m.execute()
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+    assert out.ok is False
+    assert out.phase == "rename_failed"
+    assert str(child.pid) in out.message, f"未点出占用进程：{out.message}"
+    # 源目录完好、目标端已有完整副本：这正是需要出口的那个现场
+    assert os.path.isdir(src)
+    assert (tmp_path / "dst" / "two.bin").read_bytes() == b"2" * 500
+    assert m.backup_path is None
+
+
+def test_rename_failure_without_diagnosis_still_explains(tmp_path, monkeypatch):
+    """查不出占用者时也要给出可操作的说明，不能只剩一句系统错误。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    monkeypatch.setattr(migrator_mod, "RENAME_DELAYS", (0.0,))
+    monkeypatch.setattr(migrator_mod.locks, "who_locks_many", lambda paths, **kw: [])
+
+    def deny(a, b, **kwargs):
+        raise PermissionError(13, "拒绝访问", str(a))
+
+    monkeypatch.setattr(os, "rename", deny)
+    out = m.execute()
+    assert out.phase == "rename_failed"
+    assert "未查出占用进程" in out.message
+    assert "源目录未改动" in out.message
+
+
+def test_disk_full_stops_before_verify(tmp_path, monkeypatch):
+    """B2：磁盘写满要立刻停在校验之前，并给出人能看懂的原因。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+
+    def full(*args, **kwargs):
+        raise OSError(28, "磁盘空间不足", None, 112)
+
+    monkeypatch.setattr(copier, "copy_one", full)
+    out = m.execute()
+    assert out.ok is False
+    assert out.phase == "aborted"
+    assert "空间不足" in out.message
+    assert out.verify is None, "磁盘都满了还去校验，纯属浪费时间"
+    assert out.copy.aborted == "disk_full"
+    assert os.path.isdir(src)
+
+
+def test_missing_symlink_privilege_blocks_before_copying(tmp_path, monkeypatch):
+    """B4：缺特权就一个字节都别复制，几秒内给出结论。
+
+    原来这个错误要等到几十万个文件复制完、进入建链阶段才暴露。
+    """
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.plan_it()
+    m.plan.file_symlinks = 1               # 本机造不出真身，见 test_scanner 的说明
+    monkeypatch.setattr(permission, "can_create_symlink", lambda: False)
+    calls = {"n": 0}
+
+    def spy(plan, sess, **kwargs):
+        calls["n"] += 1
+        raise AssertionError("不该走到复制")
+
+    monkeypatch.setattr(migrator_mod, "copy_run", spy)
+    out = m.execute()
+    assert out.phase == "privilege_required"
+    assert calls["n"] == 0
+    assert "文件符号链接" in out.message
+    assert not (tmp_path / "dst").exists()
+
+
+def test_symlink_privilege_preflight_passes_when_capable(tmp_path, monkeypatch):
+    """预检不能误伤：真能建符号链接时照常迁移。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.plan_it()
+    m.plan.file_symlinks = 1
+    monkeypatch.setattr(permission, "can_create_symlink", lambda: True)
+    out = m.execute()
+    assert out.ok is True, f"{out.phase} {out.message}"
+
+
+def test_no_preflight_cost_without_file_symlinks(tmp_path, monkeypatch):
+    """计划里没有文件符号链接时不该去做建链实测（那要建临时目录）。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.plan_it()
+
+    def boom():
+        raise AssertionError("没有文件符号链接却去实测建链")
+
+    monkeypatch.setattr(permission, "can_create_symlink", boom)
+    assert m.execute().ok is True
+
+
+def test_cancel_during_verify_leaves_source_untouched(tmp_path, monkeypatch):
+    """B6：校验阶段可以取消，取消后绝不能继续去改名源目录。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    state = {"copied": False}
+    real_run = copier.run
+
+    def run_then_flag(plan, sess, **kwargs):
+        result = real_run(plan, sess, **kwargs)
+        state["copied"] = True
+        return result
+
+    monkeypatch.setattr(migrator_mod, "copy_run", run_then_flag)
+    out = m.execute(should_cancel=lambda: state["copied"])
+
+    assert out.phase == "cancelled"
+    assert out.verify is not None and out.verify.cancelled is True
+    assert "源目录未改动" in out.message
+    assert os.path.isdir(src)
+    assert not migrator_mod.is_reparse_path(src)
+    assert out.backup_path is None
+    # 目标端已有完整副本，用户可以续传或清掉
+    assert (tmp_path / "dst" / "two.bin").read_bytes() == b"2" * 500
+
+
+def test_verify_progress_reaches_the_caller(tmp_path):
+    """B6：校验进度要能传到界面，阶段标记为 verifying。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    phases = []
+    out = m.execute(on_progress=lambda p: phases.append(p.phase))
+    assert out.ok is True
+    assert "copying" in phases
+    assert "verifying" in phases, "校验阶段没有发出任何进度"
+
+
+def test_discard_target_removes_partial_copy(tmp_path, monkeypatch):
+    """B1 的出口：复制失败留下的半成品目标要能一键清掉，源目录不受影响。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+
+    def denied(*args, **kwargs):
+        raise PermissionError(13, "拒绝访问", None, 5)
+
+    monkeypatch.setattr(copier, "copy_one", denied)
+    monkeypatch.setattr(copier, "RETRY_DELAYS", (0.01, 0.01))
+    out = m.execute()
+    assert out.phase == "copy_failed"
+    assert (tmp_path / "dst").exists()
+
+    assert m.discard_target() is True
+    assert m.cleanup_error == ""
+    assert not (tmp_path / "dst").exists()
+    assert (src / "two.bin").read_bytes() == b"2" * 500
+    assert m.session.phase == "discarded"
+
+
+def test_discard_target_refuses_when_source_is_link(tmp_path):
+    """迁移成功后源目录已是指向目标的链接，此时删目标等于删活数据。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+    assert out.ok is True
+
+    assert m.discard_target() is False
+    assert "链接" in m.cleanup_error
+    assert (tmp_path / "dst").exists()
+    assert (src / "two.bin").read_bytes() == b"2" * 500
+
+
+def test_discard_target_refuses_without_any_other_copy(tmp_path):
+    """源目录和备份都不在时无法确认数据另有副本，必须拒绝。"""
+    src, ext = _tree(tmp_path)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "two.bin").write_bytes(b"2" * 500)
+    m = Migrator(tmp_path / "gone", dst, session_root=tmp_path / "sessions")
+    assert m.discard_target() is False
+    assert "拒绝删除目标" in m.cleanup_error
+    assert dst.exists()
+
+
+# --- C1：续传 ------------------------------------------------------
+def test_adopt_session_refuses_a_different_tree(tmp_path):
+    """`.done` 记的是相对路径，换一棵树沿用等于把不相干的文件当成已复制而跳过。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    foreign = Session.create(r"D:\other\src", r"E:\other\dst",
+                             root=tmp_path / "sessions")
+    assert m.adopt_session(foreign) is False
+    assert m.session is None
+    assert m.adopt_session(None) is False
+
+
+def test_adopt_session_accepts_the_same_paths_regardless_of_form(tmp_path):
+    """会话文件里的大小写、正斜杠、结尾反斜杠都不该让续传失效。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    sess = Session.create(str(src).upper().replace("\\", "/"),
+                          str(tmp_path / "dst") + "\\",
+                          root=tmp_path / "sessions")
+    sess.backup_path = str(tmp_path / "bak")
+    assert m.adopt_session(sess) is True
+    assert m.session is sess
+    # 上一轮可能已经改过名，备份路径是 discard_target 判断数据是否另有副本的依据
+    assert m.backup_path == str(tmp_path / "bak")
+
+
+def test_resume_skips_files_the_previous_run_copied(tmp_path, monkeypatch):
+    """续传的意义：上一轮已经落盘且没被动过的文件直接跳过，不再重复制一遍。"""
+    src, ext = _tree(tmp_path)
+    real_copy_one = copier.copy_one
+
+    def denied_for_two_bin(s, d):
+        if str(s).endswith("two.bin"):
+            raise PermissionError(13, "拒绝访问", str(s), 5)
+        return real_copy_one(s, d)
+
+    monkeypatch.setattr(copier, "copy_one", denied_for_two_bin)
+    monkeypatch.setattr(copier, "RETRY_DELAYS", (0.0,))
+    first = _migrator(tmp_path, src)
+    out = first.execute()
+    assert out.phase == "copy_failed"
+    assert (tmp_path / "dst" / "a" / "one.txt").read_text(encoding="utf-8") == "one"
+    session_path = first.session.path
+    assert not (tmp_path / "dst" / "two.bin").exists()
+
+    monkeypatch.setattr(copier, "copy_one", real_copy_one)
+    resumed = _migrator(tmp_path, src)
+    assert resumed.adopt_session(Session.load(session_path)) is True
+    resumed.plan_it()
+    out2 = resumed.execute()
+    assert out2.ok is True, out2.message
+    assert out2.copy.skipped == 1              # one.txt 被跳过，two.bin 真的复制了
+    assert (tmp_path / "dst" / "two.bin").read_bytes() == b"2" * 500
+    # 沿用同一个会话文件，而不是又新建一个孤儿会话
+    assert resumed.session.path == session_path
+    assert len(list((tmp_path / "sessions").glob("*.json"))) == 1
+    assert resumed.session.phase == "done"
+
+
+def test_execute_records_the_run_options(tmp_path):
+    """C6：运行参数要落进会话文件，续传才有得可重放。
+
+    映射丢了最要命：目标端那几百个 junction 会在续传时被重新指回迁移前的旧位置。
+    """
+    src, ext = _tree(tmp_path)
+    moved = tmp_path / "moved"
+    m = Migrator(src, tmp_path / "dst", mappings={str(ext): str(moved)},
+                 deep_verify=True, session_root=tmp_path / "sessions")
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+
+    reloaded = Session.load(m.session.path)
+    assert reloaded.options == {"mappings": {str(ext): str(moved)},
+                                "deep_verify": True,
+                                "skip_unknown_reparse": False,
+                                "excludes": []}
+
+
+# --- C6：会话停在改名之后 ---------------------------------------------
+def _session_at(tmp_path, phase, backup=None):
+    sess = Session.create(tmp_path / "src", tmp_path / "dst",
+                          root=tmp_path / "sessions")
+    sess.phase = phase
+    sess.backup_path = str(backup) if backup else None
+    return sess
+
+
+def test_awaiting_source_link_needs_a_real_backup(tmp_path):
+    """备份不在就不能凭 phase 硬建链接：那等于凭空断言「数据已就位」。"""
+    src = tmp_path / "src"
+    assert migrator_mod.awaiting_source_link(None, src) is False
+    assert migrator_mod.awaiting_source_link(_session_at(tmp_path, "created"), src) is False
+
+    sess = _session_at(tmp_path, "link_failed")
+    assert migrator_mod.awaiting_source_link(sess, src) is False      # 没记备份路径
+    sess.backup_path = str(tmp_path / "gone")
+    assert migrator_mod.awaiting_source_link(sess, src) is False      # 备份目录不在
+
+    backup = tmp_path / "src.bak_20261010"
+    backup.mkdir()
+    sess.backup_path = str(backup)
+    for phase in ("renamed", "link_failed", "link_verify_failed"):
+        sess.phase = phase
+        assert migrator_mod.awaiting_source_link(sess, src) is True
+
+
+def test_awaiting_source_link_steps_aside_when_the_source_is_back(tmp_path):
+    """用户手工把备份改回原名之后就该走常规流程重扫重复制，不能只补一条链接。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    backup = tmp_path / "src.bak_20261010"
+    backup.mkdir()
+    sess = _session_at(tmp_path, "renamed", backup)
+    assert migrator_mod.awaiting_source_link(sess, src) is False
+
+
+def test_resume_finishes_a_run_that_stopped_after_the_rename(tmp_path, monkeypatch):
+    """C6：会话停在改名之后，源目录已经不在了。
+
+    原来 resume 一律从 execute() 头部重来：扫到一棵空树、guard 报「源目录不存在」，
+    用户明明只差最后一步，唯一的出口却是回滚——几小时的迁移白做。
+    """
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    real_create = _break_source_link(monkeypatch, src)
+    out = m.execute()
+    assert out.phase == "link_failed"
+    backup = out.backup_path
+    assert os.path.isdir(backup)
+    assert not os.path.exists(src)              # 源路径此刻什么都不是
+    assert (tmp_path / "dst" / "two.bin").read_bytes() == b"2" * 500
+    session_path = m.session.path
+
+    monkeypatch.setattr("dmig.core.linker.create", real_create)
+    resumed = _migrator(tmp_path, src)
+    assert resumed.adopt_session(Session.load(session_path)) is True
+    out2 = resumed.execute()
+
+    assert out2.ok is True, f"{out2.phase} {out2.message}"
+    assert out2.link_kind == "junction"
+    assert out2.copy is None                    # 这一趟没有复制任何东西
+    assert "只补建了源目录链接" in out2.message
+    # 源路径重新可访问，内容来自目标端
+    assert (src / "two.bin").read_bytes() == b"2" * 500
+    assert (src / "a" / "one.txt").read_text(encoding="utf-8") == "one"
+    # 备份原封不动，仍然可以清理或回滚
+    assert os.path.isdir(backup)
+    assert out2.backup_path == backup
+    assert resumed.session.phase == "done"
+    assert len(list((tmp_path / "sessions").glob("*.json"))) == 1
+
+
+def test_resume_after_rename_reports_a_link_that_cannot_be_created(
+        tmp_path, monkeypatch):
+    """补建这一步自己也可能失败：要如实回报，不能假装迁移完成。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    _break_source_link(monkeypatch, src)
+    assert m.execute().phase == "link_failed"
+    session_path = m.session.path
+
+    resumed = _migrator(tmp_path, src)
+    assert resumed.adopt_session(Session.load(session_path)) is True
+    out = resumed.execute()
+
+    assert out.ok is False
+    assert out.phase == "link_failed"
+    assert "boom" in out.message
+    assert resumed.session.phase == "link_failed"
+    # 目标端的数据与备份都没被动过
+    assert (tmp_path / "dst" / "two.bin").read_bytes() == b"2" * 500
+    assert os.path.isdir(out.backup_path)
+
+
+# --- C3：卷层面的前置校验 ---------------------------------------------
+def test_guard_errors_passes_the_link_count(tmp_path, monkeypatch):
+    """目标卷存不下链接时，guard 只有拿到链接条数才能判成致命错误。
+
+    少传这一个参数，前置校验就永远只给一句提示，迁移照跑，
+    最后死在复制完几小时之后的建链阶段。
+    """
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    plan = m.plan_it()
+    assert plan.links
+
+    seen: dict = {}
+    real = migrator_mod.guard.check
+
+    def spy(source, target, **kwargs):
+        seen.update(kwargs)
+        return real(source, target, **kwargs)
+
+    monkeypatch.setattr(migrator_mod.guard, "check", spy)
+    assert m.guard_errors() == []
+    assert seen == {"required_bytes": plan.required_bytes,
+                    "link_count": len(plan.links)}
+
+
+def test_guard_errors_without_a_plan_assumes_no_links(tmp_path, monkeypatch):
+    seen: dict = {}
+    real = migrator_mod.guard.check
+
+    def spy(source, target, **kwargs):
+        seen.update(kwargs)
+        return real(source, target, **kwargs)
+
+    src = tmp_path / "src"
+    src.mkdir()
+    m = _migrator(tmp_path, src)
+    monkeypatch.setattr(migrator_mod.guard, "check", spy)
+    m.guard_errors()
+    assert seen == {"required_bytes": 0, "link_count": 0}
+
+
+# --- C5：断链全链路可见 -----------------------------------------------
+def test_dangling_link_is_recorded_in_the_outcome(tmp_path):
+    """断链在源里就已经指着空气，下游（计划页、报告）要靠这条记录标出来。"""
+    src, ext = _tree(tmp_path)
+    reparse.create_junction(src / "gone", tmp_path / "vanished")
+
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+
+    by_rel = {link["rel"]: link for link in out.links}
+    assert by_rel["gone"]["is_dangling"] is True
+    assert by_rel["link-pkg"]["is_dangling"] is False
+    # 照样原样重建了：目标端仍然是一条链接，只是依旧指不到东西
+    assert migrator_mod.is_reparse_path(tmp_path / "dst" / "gone")
+    # 会话文件里也留着，导出报告与事后排查都靠它
+    assert Session.load(m.session.path).links == out.links
+
+
+def test_links_record_what_was_rebuilt_even_if_a_later_step_fails(tmp_path, monkeypatch):
+    """清单来自会话记录的实际动作，不是计划里的打算。
+
+    建链刻意排在批量复制之前（否则要等几小时才发现权限错误），所以后面的校验
+    失败时链接已经在目标端建好了；清单里如实反映这一点，用户才知道现场是什么样。
+    """
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    monkeypatch.setattr("dmig.core.migrator.verifier.verify",
+                        lambda *a, **k: __import__("dmig.core.models", fromlist=["VerifyResult"])
+                        .VerifyResult(ok=False, missing=["two.bin"]))
+    out = m.execute()
+    assert out.phase == "verify_failed"
+    assert [link["rel"] for link in out.links] == ["link-pkg"]
+    assert migrator_mod.is_reparse_path(tmp_path / "dst" / "link-pkg")
+
+
+# --- C8：目标端重建出来的每个链接都要核对 -----------------------------
+def test_misdirected_rebuilt_link_stops_before_the_rename(tmp_path, monkeypatch):
+    """映射填错（少一个反斜杠、指到别的盘）会让目标端链接指到别处。
+
+    此前只验顶层那条源目录链接，成百上千个嵌套 junction 建错位置没人知道；
+    而顶层链接照样能打开，校验也照样通过——错误就一路留到用户某天点开它。
+    """
+    src, ext = _tree(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    real_create = linker.create
+
+    def misdirect(link_path, target, is_dir, prefer_junction=True):
+        if os.path.basename(str(link_path)) == "link-pkg":
+            target = elsewhere         # 模拟映射错了
+        return real_create(link_path, target, is_dir,
+                           prefer_junction=prefer_junction)
+
+    monkeypatch.setattr("dmig.core.linker.create", misdirect)
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+
+    assert out.ok is False
+    assert out.phase == "links_broken"
+    assert "link-pkg" in out.message
+    # 失败发生在改名之前：源目录原封不动，也没有留下备份
+    assert not migrator_mod.is_reparse_path(src)
+    assert (src / "two.bin").read_bytes() == b"2" * 500
+    assert not list(tmp_path.glob("src.bak_*"))
+    # 源完好的现场留给用户的就是这条出路
+    assert m.discard_target() is True
+    assert not (tmp_path / "dst").exists()
+
+
+# --- C9：复制保不住的属性 ---------------------------------------------
+def test_outcome_discloses_attributes_copy_cannot_preserve(tmp_path):
+    """硬链接复制后成了两份独立数据：报告要看得到，否则「校验通过」被当成没变。"""
+    src, ext = _tree(tmp_path)
+    os.link(str(src / "two.bin"), str(src / "two-copy.bin"))
+
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+    assert out.hardlinked_files == 2
+    assert out.sparse_files == 0
+    assert out.ads_files == 0
+    # 两份副本确实各自独立了：删掉目标端其中一份，另一份必须还在
+    (tmp_path / "dst" / "two-copy.bin").unlink()
+    assert (tmp_path / "dst" / "two.bin").read_bytes() == b"2" * 500
+
+
+# --- C4：排除目录 -----------------------------------------------------
+def _tree_with_locked(tmp_path):
+    src, ext = _tree(tmp_path)
+    locked = src / "locked"
+    locked.mkdir()
+    (locked / "secret.bin").write_bytes(b"s" * 100)
+    return src, ext, locked
+
+
+def test_excluded_directory_migrates_and_is_disclosed(tmp_path):
+    """无权限目录此前是死路：扫描报错、迁移直接拒绝执行，用户没有出口。"""
+    src, ext, locked = _tree_with_locked(tmp_path)
+    m = Migrator(src, tmp_path / "dst", session_root=tmp_path / "sessions",
+                 excludes=[str(locked)])
+
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+    assert out.excluded == ["locked"]
+    assert not (tmp_path / "dst" / "locked").exists()
+    # 被排除的内容只存在于备份里，删备份前必须拦住
+    assert m.excluded_count() == 1
+    assert m.cleanup_backup() is False
+    assert "1 个目录被排除" in m.cleanup_error
+    assert m.cleanup_backup(force=True) is True
+
+
+def test_excludes_are_written_to_the_session(tmp_path):
+    """排除项丢了，续传会把用户明确排除的目录重新复制一遍、空间也白占。"""
+    src, ext, locked = _tree_with_locked(tmp_path)
+    m = Migrator(src, tmp_path / "dst", session_root=tmp_path / "sessions",
+                 excludes=[str(locked)])
+    assert m.execute().ok
+
+    assert Session.load(m.session.path).options["excludes"] == [str(locked)]
+
+
+def test_nothing_excluded_leaves_cleanup_unblocked(tmp_path):
+    """没有排除项时，删备份不该被这条新规则平白拦下。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    assert m.execute().ok
+    assert m.excluded_count() == 0
+    assert m.cleanup_backup() is True
+
+
+# --- C2：接管属主与 ACL 还原 -----------------------------------------
+def test_take_over_requires_elevation(tmp_path, monkeypatch):
+    """接管属主必须提权；不提权时要给出明确原因，而不是静默返回 0。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    monkeypatch.setattr(migrator_mod.permission, "is_elevated", lambda: False)
+    taken, error = m.take_over_denied()
+    assert taken == 0
+    assert "管理员权限" in error
+
+
+def test_take_over_records_the_acl_before_touching_the_owner(tmp_path, monkeypatch):
+    """顺序不能反：必须先导出原 ACL 再改属主。
+
+    反过来就是拿被改过的描述符当原件——原属主已经换人，回滚也还原不回去。
+    """
+    src, ext = _tree(tmp_path)
+    locked = src / "locked"
+    locked.mkdir()
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    m.plan.permission_issues = [str(locked)]      # 模拟扫描到的无权限目录
+
+    order: list[tuple[str, str]] = []
+    monkeypatch.setattr(migrator_mod.permission, "is_elevated", lambda: True)
+    monkeypatch.setattr(
+        migrator_mod.permission, "backup_acl",
+        lambda p: order.append(("backup", p)) or "D:AI(A;OICI;FA;;;SY)")
+    monkeypatch.setattr(
+        migrator_mod.permission, "take_ownership",
+        lambda p: order.append(("take", p)) or True)
+
+    assert m.take_over_denied() == (1, "")
+    assert order == [("backup", str(locked)), ("take", str(locked))]
+    assert m.session.acl_backup == [{"path": str(locked),
+                                     "sddl": "D:AI(A;OICI;FA;;;SY)"}]
+    # 权限变了，旧计划作废，必须重扫（这里权限是替身，因此仍会报同样的目录）
+    assert m.plan is not None
+
+
+def test_take_over_keeps_going_when_the_acl_cannot_be_read(tmp_path, monkeypatch):
+    """连 READ_CONTROL 都没有时记下 sddl=None 照样接管，但不会假装能还原。"""
+    src, ext = _tree(tmp_path)
+    locked = src / "locked"
+    locked.mkdir()
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    m.plan.permission_issues = [str(locked)]
+
+    monkeypatch.setattr(migrator_mod.permission, "is_elevated", lambda: True)
+    monkeypatch.setattr(migrator_mod.permission, "backup_acl", lambda p: None)
+    monkeypatch.setattr(migrator_mod.permission, "take_ownership", lambda p: True)
+
+    assert m.take_over_denied() == (1, "")
+    assert m.session.acl_backup == [{"path": str(locked), "sddl": None}]
+
+
+def test_take_over_reports_total_failure(tmp_path, monkeypatch):
+    src, ext = _tree(tmp_path)
+    locked = src / "locked"
+    locked.mkdir()
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    m.plan.permission_issues = [str(locked)]
+
+    monkeypatch.setattr(migrator_mod.permission, "is_elevated", lambda: True)
+    monkeypatch.setattr(migrator_mod.permission, "backup_acl", lambda p: "SDDL")
+    monkeypatch.setattr(migrator_mod.permission, "take_ownership", lambda p: False)
+
+    taken, error = m.take_over_denied()
+    assert taken == 0
+    assert "接管失败" in error and "locked" in error
+
+
+def _migrator_with_acl(tmp_path, sddl="SDDL"):
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.session = Session.create(src, tmp_path / "dst", root=tmp_path / "sessions")
+    m.session.acl_backup = [{"path": str(src / "a"), "sddl": sddl}]
+    m.session.save()
+    return m
+
+
+def test_rollback_restores_the_taken_over_acl(tmp_path, monkeypatch):
+    """接管把源树上的属主改掉了；回滚不还原等于永久改掉用户的权限配置。"""
+    m = _migrator_with_acl(tmp_path)
+    restored: list[tuple[str, str]] = []
+    monkeypatch.setattr(migrator_mod.permission, "restore_acl",
+                        lambda path, sddl: restored.append((path, sddl)) or True)
+
+    assert m.rollback() is True
+    assert restored == [(str(m.source / "a"), "SDDL")]
+    assert m.cleanup_error == ""
+
+
+def test_acl_restore_follows_the_renamed_backup(tmp_path, monkeypatch):
+    """接管发生在源树上，回滚时源目录可能已改名成备份，路径要跟着换算。
+
+    不换算就会打在一条不存在的路径上，权限永远回不去。
+    """
+    m = _migrator_with_acl(tmp_path)
+    backup = tmp_path / "src.bak_20261009120000"
+    os.rename(m.source, backup)
+    m.backup_path = str(backup)
+
+    seen: list[str] = []
+    monkeypatch.setattr(migrator_mod.permission, "restore_acl",
+                        lambda path, sddl: seen.append(path) or True)
+
+    assert m._restore_acl() == []
+    assert seen == [str(backup / "a")]
+
+
+def test_acl_restore_failures_are_reported(tmp_path, monkeypatch):
+    """还原失败必须说出来，否则用户以为权限已经退回去了。"""
+    m = _migrator_with_acl(tmp_path)
+    monkeypatch.setattr(migrator_mod.permission, "restore_acl", lambda p, s: False)
+
+    assert m.rollback() is True
+    assert "1 个目录的原始权限没能还原" in m.cleanup_error
+
+
+def test_acl_entry_without_a_recorded_sddl_is_not_a_failure(tmp_path, monkeypatch):
+    """接管时就告知过「这个路径的原 ACL 没记下来」，回滚时不该再算失败。"""
+    m = _migrator_with_acl(tmp_path, sddl=None)
+    monkeypatch.setattr(migrator_mod.permission, "restore_acl", lambda p, s: False)
+    assert m._restore_acl() == []
+
+
+def test_acl_restore_is_a_noop_without_records(tmp_path, monkeypatch):
+    """没接管过就不该碰任何权限：GetNamedSecurityInfo 之外的写操作都有风险。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.session = Session.create(src, tmp_path / "dst", root=tmp_path / "sessions")
+
+    def boom(path, sddl):
+        raise AssertionError("没有接管记录时不该调用 restore_acl")
+
+    monkeypatch.setattr(migrator_mod.permission, "restore_acl", boom)
+    assert m._restore_acl() == []
+
+
+# --- C1：重新校验的比对基准 -------------------------------------------
+def test_reverify_baseline_is_the_source_before_migration(tmp_path):
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    assert m.reverify_baseline() == (str(src), "")
+
+
+def test_reverify_baseline_switches_to_the_backup_after_migration(tmp_path):
+    """迁移成功后源已经是指向目标的链接：拿它当原件就是拿目标和目标自己比。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+
+    baseline, error = m.reverify_baseline()
+    assert error == ""
+    assert baseline == out.backup_path
+    assert os.path.normcase(baseline) != os.path.normcase(str(src))
+
+
+def test_reverify_baseline_is_honest_when_the_backup_is_gone(tmp_path):
+    """原件都没了就如实说，绝不能返回一个假的通过。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    assert m.execute().ok
+    assert m.cleanup_backup() is True            # 备份删了，源又已是链接
+
+    baseline, error = m.reverify_baseline()
+    assert baseline == ""
+    assert "没有可比对的原件" in error
+
+
+def test_reverify_detects_a_corrupted_target_after_migration(tmp_path):
+    """实证：迁移后把目标文件改坏，「重新校验」必须报出不一致。
+
+    修复前它比的是目标和目标自己，改坏也一样通过。
+    """
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    assert m.execute().ok
+
+    (tmp_path / "dst" / "two.bin").write_bytes(b"CORRUPTED!!")   # 大小也变了
+    baseline, error = m.reverify_baseline()
+    assert error == ""
+
+    result = migrator_mod.verifier.verify(baseline, m.target)
+    assert result.ok is False
+    assert "two.bin" in result.mismatch
+
+
+def test_reverify_catches_a_same_size_change(tmp_path):
+    """同大小、只改了内容与时间戳的改动同样要查得出来。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+
+    target_file = tmp_path / "dst" / "two.bin"
+    target_file.write_bytes(b"9" * 500)
+    stamp = os.stat(os.path.join(out.backup_path, "two.bin")).st_mtime + 60
+    os.utime(target_file, (stamp, stamp))
+
+    baseline, _ = m.reverify_baseline()
+    assert migrator_mod.verifier.verify(baseline, m.target).ok is False
+

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
+from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (QFileDialog, QFormLayout, QHBoxLayout,
                                QHeaderView, QTableWidgetItem, QVBoxLayout,
                                QWidget)
@@ -16,14 +17,16 @@ import qfluentwidgets as qf
 
 from . import chrome, theme
 from .format import human_bytes
-from .report import CSV_HEADER, build_rows, summarize, unfinished_rows, write_csv
+from .report import (CSV_HEADER, KIND_DANGLING, build_rows, link_rows, summarize,
+                     unfinished_rows, write_csv)
 
 STAT_ROWS = (("copied_files", "成功复制（个）"),
              ("copied_bytes", "成功复制（字节）"),
              ("skipped", "跳过（已存在）"),
              ("failed", "复制失败"),
              ("missing", "校验缺失"),
-             ("mismatch", "校验不一致"))
+             ("mismatch", "校验不一致"),
+             ("dangling", "断链（原样重建）"))
 
 
 class ReportPage(QWidget):
@@ -32,6 +35,7 @@ class ReportPage(QWidget):
     rollback_requested = Signal()
     cleanup_requested = Signal()
     reverify_requested = Signal()
+    discard_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -82,6 +86,7 @@ class ReportPage(QWidget):
         # 破坏性动作用普通按钮，不抢主色
         self.export_button = qf.PushButton("导出 CSV")
         self.reverify_button = qf.PushButton("重新校验")
+        self.discard_button = qf.PushButton("删除目标")
         self.rollback_button = qf.PushButton("一键回滚")
         self.cleanup_button = qf.PushButton("删除备份")
         buttons = QHBoxLayout()
@@ -90,6 +95,7 @@ class ReportPage(QWidget):
         buttons.addWidget(self.export_button)
         buttons.addWidget(self.reverify_button)
         buttons.addStretch(1)
+        buttons.addWidget(self.discard_button)
         buttons.addWidget(self.rollback_button)
         buttons.addWidget(self.cleanup_button)
 
@@ -104,6 +110,7 @@ class ReportPage(QWidget):
 
         self.export_button.clicked.connect(self._on_export_clicked)
         self.reverify_button.clicked.connect(self.reverify_requested.emit)
+        self.discard_button.clicked.connect(self.discard_requested.emit)
         self.rollback_button.clicked.connect(self.rollback_requested.emit)
         self.cleanup_button.clicked.connect(self.cleanup_requested.emit)
         self.set_actions_enabled(False, False)
@@ -122,19 +129,31 @@ class ReportPage(QWidget):
             self.stat_labels[key].setText(text)
 
         self.table.setRowCount(0)
-        for row in unfinished_rows(outcome):
+        rows = unfinished_rows(outcome)
+        detail = {row[1]: row[2] for row in link_rows(outcome)}
+        red = QBrush(QColor(theme.error_color()))
+        for row in rows:
             index = self.table.rowCount()
             self.table.insertRow(index)
             for column, text in enumerate(row):
-                self.table.setItem(index, column, QTableWidgetItem(text))
+                item = QTableWidgetItem(text)
+                if row[0] == KIND_DANGLING:
+                    item.setForeground(red)
+                    # 表格里只放结论，完整指向靠 tooltip 与导出的 CSV 兜住
+                    item.setToolTip(detail.get(row[1], text))
+                self.table.setItem(index, column, item)
 
         self.message_label.setText(getattr(outcome, "message", "") or "")
         has_backup = bool(getattr(outcome, "backup_path", None))
-        self.set_actions_enabled(has_backup, has_backup)
+        # 没成功又没备份 = 源目录完好、目标端留着半成品，这正是需要清理出口的现场
+        self.set_actions_enabled(has_backup, has_backup,
+                                 discard=not ok and not has_backup)
 
-    def set_actions_enabled(self, rollback: bool, cleanup: bool) -> None:
+    def set_actions_enabled(self, rollback: bool, cleanup: bool,
+                            discard: bool = False) -> None:
         self.rollback_button.setEnabled(rollback)
         self.cleanup_button.setEnabled(cleanup)
+        self.discard_button.setEnabled(discard)
 
     def summary_text(self, key: str) -> str:
         return self.stat_labels[key].text()

@@ -124,3 +124,70 @@ def test_verify_detects_broken_link(tmp_path):
     link = tmp_path / "link"
     linker.create(link, missing, is_dir=True, prefer_junction=True)
     assert linker.verify(link) is False
+
+
+# --- 指向比对（C8：目标端每个链接都要能核对） -------------------------
+
+@pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows")
+def test_points_to_matches_the_planned_target(tmp_path):
+    store = tmp_path / "store"
+    store.mkdir()
+    link = tmp_path / "link"
+    linker.create(link, store, is_dir=True, prefer_junction=True)
+    assert linker.points_to(link, str(store)) is True
+    assert linker.points_to(link, str(tmp_path / "elsewhere")) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows")
+def test_points_to_reads_a_dangling_link(tmp_path):
+    """断链的目标不存在，只能靠 readlink 读出指向——exists 那套在这种现场全是 False。"""
+    missing = tmp_path / "vanished"
+    link = tmp_path / "link"
+    linker.create(link, missing, is_dir=True, prefer_junction=True)
+    assert os.path.exists(link) is False
+    assert linker.resolved_target(link) == str(missing)
+    assert linker.points_to(link, str(missing)) is True
+
+
+def test_resolved_target_of_a_missing_entry_is_empty(tmp_path):
+    assert linker.resolved_target(tmp_path / "nope") == ""
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows")
+def test_points_to_resolves_a_relative_wanted_against_the_link_dir(tmp_path):
+    """相对链接的计划目标就是那个相对值。
+
+    不按链接所在目录解析就直接比，任意一条相对链接都会被判成「指错了」——
+    续传会白拆重建一遍，C8 的逐链接核对更会把整趟迁移拦在最后一步。
+    """
+    real = tmp_path / "a" / "target"
+    real.mkdir(parents=True)
+    (tmp_path / "a" / "b").mkdir()
+    link = tmp_path / "a" / "b" / "link"
+    linker.create(link, real, is_dir=True, prefer_junction=True)
+
+    assert linker.points_to(link, r"..\target") is True
+    assert linker.points_to(link, r"..\other") is False
+
+
+def test_group_targets_reports_applied_mapping():
+    """A1：分组要回显已应用的映射，界面重扫后才能把值填回同一行。"""
+    targets = [r"C:\cache\a\x", r"C:\cache\b\y"]
+    groups = linker.group_targets(targets, {r"C:\cache": r"E:\cache"})
+    assert len(groups) == 1
+    assert groups[0].prefix == r"C:\cache"
+    assert groups[0].mapped_to == r"E:\cache"
+
+
+def test_group_targets_without_mapping_leaves_blank():
+    groups = linker.group_targets([r"C:\cache\a\x", r"C:\cache\b\y"], {})
+    assert groups[0].mapped_to == ""
+
+
+def test_resolve_target_exposes_origin():
+    """映射前的原始目标要单独返回，归属表按它分组。"""
+    raw = r"C:\cache\_npx\abc"
+    r = linker.resolve_target(raw, r"D:\src\nm\abc", SRC, DST,
+                              {r"C:\cache": r"E:\cache"})
+    assert r.origin_target == raw
+    assert r.new_target == r"E:\cache\_npx\abc"
