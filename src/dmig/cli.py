@@ -24,6 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--exclude", action="append", default=[],
                         help="整棵跳过的目录（可重复）。跳过的内容不会复制到目标，"
                              "只保留在备份里")
+    p_scan.add_argument("--no-ads-scan", action="store_true",
+                        help="不探测附加数据流（ADS）。探测要对每个文件问一次文件系统，"
+                             "几十万文件下是可测的常数开销；关掉后计划里不再报 ADS 条数")
     p_scan.add_argument("--skip-unknown-reparse", action="store_true",
                         help="跳过非链接类重解析点（默认按真实内容复制）")
 
@@ -36,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_mig.add_argument("--take-ownership", action="store_true",
                        help="以管理员身份运行时，接管无权限目录的属主"
                             "（会先把原始 ACL 记进会话，回滚时还原）")
+    p_mig.add_argument("--no-ads-scan", action="store_true",
+                       help="不探测附加数据流（ADS），扫描更快；详见 scan 的同名参数")
     p_mig.add_argument("--yes", action="store_true", help="跳过交互确认")
     p_mig.add_argument("--dry-run", action="store_true", help="只出计划，不改动任何东西")
     p_mig.add_argument("--sha256", action="store_true", help="启用逐文件哈希校验")
@@ -84,7 +89,8 @@ def _migrator_from_session(sess: Session) -> Migrator:
                     deep_verify=bool(opts.get("deep_verify")),
                     session_root=sess.path.parent,
                     skip_unknown_reparse=bool(opts.get("skip_unknown_reparse")),
-                    excludes=list(opts.get("excludes") or []))
+                    excludes=list(opts.get("excludes") or []),
+                    probe_ads=bool(opts.get("probe_ads", True)))
 
 
 def _warn_symlink_privilege(plan) -> None:
@@ -121,6 +127,9 @@ def _warn_lossy_attributes(plan) -> None:
     if text:
         print(f"警告：{text}。这些不会让复制失败，但结果与原件不再逐字节相同。",
               file=sys.stderr)
+    if not getattr(plan, "ads_probed", True):
+        print("提示：本次没有探测附加数据流（--no-ads-scan），"
+              "上面的 ADS 条数不代表实际数量。", file=sys.stderr)
 
 
 def _guard_issues(source, target, plan) -> list:
@@ -192,14 +201,23 @@ def _print_plan(plan) -> None:
             "sparse_files": plan.sparse_files,
             "hardlinked_files": plan.hardlinked_files,
             "ads_files": plan.ads_files,
+            "ads_probed": getattr(plan, "ads_probed", True),
         },
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+def _print_log_path(outcome, stream=None) -> None:
+    """把运行日志的位置告诉用户。"""
+    path = getattr(outcome, "log_path", "")
+    if path:
+        print(f"运行日志：{path}", file=stream or sys.stdout)
+
+
 def _report_failure(outcome, migrator) -> None:
     """失败原因与下一步出路一起给出，别让用户对着一句 WinError 猜。"""
     print(f"失败于 {outcome.phase}：{outcome.message}", file=sys.stderr)
+    _print_log_path(outcome, sys.stderr)
     if outcome.phase in ("link_failed", "link_verify_failed"):
         print("提示：数据已复制到目标并通过校验，源目录已改名为备份。"
               "解决原因后 dmig resume <会话文件> 只补建源目录链接；"
@@ -220,7 +238,8 @@ def main(argv: list[str] | None = None) -> int:
         plan = scanner.scan(args.source, args.target,
                             mappings=_parse_maps(args.map),
                             skip_unknown_reparse=args.skip_unknown_reparse,
-                            excludes=args.exclude)
+                            excludes=args.exclude,
+                            probe_ads=not args.no_ads_scan)
         _print_plan(plan)
         _warn_symlink_privilege(plan)
         _warn_dangling_links(plan)
@@ -239,7 +258,8 @@ def main(argv: list[str] | None = None) -> int:
                             deep_verify=args.sha256,
                             session_root=args.session_root,
                             skip_unknown_reparse=args.skip_unknown_reparse,
-                            excludes=args.exclude)
+                            excludes=args.exclude,
+                            probe_ads=not args.no_ads_scan)
         plan = migrator.plan_it()
         if args.take_ownership and plan.permission_issues:
             if not permission.is_elevated():
@@ -272,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
             _report_failure(outcome, migrator)
             return 1
         print(f"迁移完成，链接类型 {outcome.link_kind}，备份 {outcome.backup_path}")
+        _print_log_path(outcome)
         if not args.keep_backup:
             if migrator.cleanup_backup():
                 print("备份已清理")
@@ -350,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
             _report_failure(outcome, migrator)
             return 1
         print(f"迁移完成，链接类型 {outcome.link_kind}，备份 {outcome.backup_path}")
+        _print_log_path(outcome)
         if not migrator.cleanup_backup():
             print(f"备份未删除：{migrator.cleanup_error}", file=sys.stderr)
         return 0

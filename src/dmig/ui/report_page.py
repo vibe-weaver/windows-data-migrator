@@ -45,6 +45,12 @@ class ReportPage(QWidget):
 
         self.message_label = qf.BodyLabel("")
         self.message_label.setWordWrap(True)
+        # 运行日志的位置：失败现场往往已经变了（源被改名成备份、目标端着半成品），
+        # 复盘全过程只能靠这份日志，所以摆在报告里而不是只留在终端输出里。
+        self.log_label = qf.CaptionLabel("")
+        self.log_label.setWordWrap(True)
+        self.log_label.setTextColor(*theme.MUTED)
+        self.log_label.hide()
 
         stats_card = chrome.Card()
         stats_layout = QVBoxLayout(stats_card)
@@ -104,6 +110,7 @@ class ReportPage(QWidget):
         layout.setSpacing(12)
         layout.addWidget(self.title_label)
         layout.addWidget(self.message_label)
+        layout.addWidget(self.log_label)
         layout.addWidget(stats_card)
         layout.addWidget(table_card, 1)
         layout.addLayout(buttons)
@@ -144,6 +151,9 @@ class ReportPage(QWidget):
                 self.table.setItem(index, column, item)
 
         self.message_label.setText(getattr(outcome, "message", "") or "")
+        log_path = getattr(outcome, "log_path", "") or ""
+        self.log_label.setText(f"运行日志：{log_path}" if log_path else "")
+        self.log_label.setVisible(bool(log_path))
         has_backup = bool(getattr(outcome, "backup_path", None))
         # 没成功又没备份 = 源目录完好、目标端留着半成品，这正是需要清理出口的现场
         self.set_actions_enabled(has_backup, has_backup,

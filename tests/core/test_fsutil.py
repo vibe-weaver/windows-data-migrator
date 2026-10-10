@@ -280,3 +280,72 @@ def test_has_alternate_streams_detects_a_zone_identifier(tmp_path):
 def test_has_alternate_streams_on_a_missing_file_is_false(tmp_path):
     """查不出来时按「没有」处理，不能让一个读不到的条目打断整趟扫描。"""
     assert fsutil.has_alternate_streams(str(tmp_path / "nope")) is False
+
+
+# --- D6：剩余空间按卷缓存 ---------------------------------------------
+
+def test_cached_free_bytes_is_reused_within_the_ttl(tmp_path, monkeypatch):
+    """选择页每敲一个字符就刷一次剩余空间，不能每次都去问文件系统。"""
+    fsutil.clear_free_cache()
+    calls: list[str] = []
+
+    def fake(path):
+        calls.append(str(path))
+        return 1234
+
+    monkeypatch.setattr(fsutil, "volume_free_bytes", fake)
+    try:
+        assert fsutil.cached_free_bytes(str(tmp_path)) == 1234
+        assert fsutil.cached_free_bytes(str(tmp_path / "sub" / "deeper")) == 1234
+        assert len(calls) == 1, "同一个卷根应当只查一次"
+    finally:
+        fsutil.clear_free_cache()
+
+
+def test_cached_free_bytes_reports_unavailable_as_minus_one(tmp_path, monkeypatch):
+    """查不到要和「真的只剩 0 字节」分开，否则界面会把「不知道」显示成 0 B。"""
+    fsutil.clear_free_cache()
+
+    def boom(path):
+        raise OSError("盘不见了")
+
+    monkeypatch.setattr(fsutil, "volume_free_bytes", boom)
+    try:
+        assert fsutil.cached_free_bytes(str(tmp_path)) == -1
+    finally:
+        fsutil.clear_free_cache()
+
+
+def test_cached_free_bytes_caches_the_failure_too(tmp_path, monkeypatch):
+    """断开的映射盘不能每个按键都再阻塞一次，失败结果也要缓存。"""
+    fsutil.clear_free_cache()
+    calls: list[int] = []
+
+    def boom(path):
+        calls.append(1)
+        raise OSError("盘不见了")
+
+    monkeypatch.setattr(fsutil, "volume_free_bytes", boom)
+    try:
+        fsutil.cached_free_bytes(str(tmp_path))
+        fsutil.cached_free_bytes(str(tmp_path))
+        assert len(calls) == 1
+    finally:
+        fsutil.clear_free_cache()
+
+
+def test_cached_free_bytes_expires(tmp_path, monkeypatch):
+    fsutil.clear_free_cache()
+    calls: list[int] = []
+
+    def fake(path):
+        calls.append(1)
+        return 1
+
+    monkeypatch.setattr(fsutil, "volume_free_bytes", fake)
+    try:
+        fsutil.cached_free_bytes(str(tmp_path), ttl=0.0)
+        fsutil.cached_free_bytes(str(tmp_path), ttl=0.0)
+        assert len(calls) == 2
+    finally:
+        fsutil.clear_free_cache()

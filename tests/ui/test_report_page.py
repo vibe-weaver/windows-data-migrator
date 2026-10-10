@@ -160,6 +160,21 @@ def test_dangling_links_reach_the_exported_csv(page, tmp_path):
     assert "D:\\vanished" in text
 
 
+# --- D8：运行日志入口 -------------------------------------------------
+
+def test_report_shows_the_run_log_path(page):
+    page.load(_outcome(log_path=r"E:\sessions\20261010-101010-ab12.log"))
+    assert page.log_label.isVisibleTo(page) is True
+    assert r"E:\sessions\20261010-101010-ab12.log" in page.log_label.text()
+
+
+def test_report_hides_the_log_line_when_there_is_none(page):
+    """没有日志时不留一个空行——老会话、以及测试里的假 outcome 都没有。"""
+    page.load(_outcome())
+    assert page.log_label.isVisibleTo(page) is False
+    assert page.log_label.text() == ""
+
+
 # --- C9：复制保不住的属性 ---------------------------------------------
 
 def test_lossy_attributes_get_a_row(page):

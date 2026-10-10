@@ -261,3 +261,83 @@ def test_unreadable_directory_can_be_excluded_instead_of_denied(tmp_path, monkey
     assert plan.permission_issues == []
     assert plan.excluded == ["locked"]
     assert plan.totals.files == 1
+
+
+# --- D1：ADS 探测可关 -------------------------------------------------
+
+def test_ads_probe_can_be_switched_off(tmp_path, monkeypatch):
+    """ADS 探测是对每个文件问一次文件系统，几十万文件下是可测的常数开销。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.bin").write_bytes(b"x")
+    (src / "b.bin").write_bytes(b"y")
+
+    probed_paths: list[str] = []
+    monkeypatch.setattr(scanner, "has_alternate_streams",
+                        lambda path: probed_paths.append(str(path)) or True)
+
+    probed = scanner.scan(src, tmp_path / "dst")
+    assert probed.ads_files == 2
+    assert probed.ads_probed is True
+    assert len(probed_paths) == 2
+
+    probed_paths.clear()
+    skipped = scanner.scan(src, tmp_path / "dst", probe_ads=False)
+    assert probed_paths == [], "关掉之后不该再逐文件探测"
+    assert skipped.ads_files == 0
+    # 关键：如实记「没问过」，不能把没探测混同于「一个都没有」
+    assert skipped.ads_probed is False
+
+
+def test_sparse_and_hardlinks_survive_the_ads_switch(tmp_path):
+    """关掉的只是 ADS 那次额外调用；稀疏与硬链接复用 lstat，没有理由一起不数。"""
+    src = tmp_path / "src"
+    src.mkdir()
+    first = src / "a.bin"
+    first.write_bytes(b"x" * 100)
+    os.link(str(first), str(src / "b.bin"))
+
+    plan = scanner.scan(src, tmp_path / "dst", probe_ads=False)
+    assert plan.hardlinked_files == 2
+    assert plan.ads_probed is False
+
+
+# --- D7：惰性迭代目录条目 ---------------------------------------------
+
+def test_a_directory_failing_mid_listing_does_not_kill_the_scan(tmp_path, monkeypatch):
+    """网络盘读到一半断开、条目被并发删掉：保留已扫到的部分，别把整趟带崩。
+
+    旧写法把 list(it) 放在 try 里，这类错误被吞掉后整目录跳过；改成惰性迭代后
+    next() 抛出的 OSError 没人兜，必须就地接住。
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_text("a", encoding="utf-8")
+    real_scandir = os.scandir
+
+    class _FlakyScandir:
+        """真实条目照常产出，取完之后不抛 StopIteration 而是抛 OSError。"""
+
+        def __init__(self, path):
+            self._it = real_scandir(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._it.close()
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            try:
+                return next(self._it)
+            except StopIteration:
+                raise OSError(59, "网络名已删除") from None
+
+    monkeypatch.setattr(os, "scandir", lambda path: _FlakyScandir(path))
+    plan = scanner.scan(src, tmp_path / "dst")
+    assert plan.totals.files == 1
+    assert plan.totals.dirs == 0

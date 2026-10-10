@@ -17,7 +17,7 @@ PROGRESS_INTERVAL = 0.1
 
 def scan(source, target, mappings: dict[str, str] | None = None,
          on_progress=None, skip_unknown_reparse: bool = False,
-         excludes=()) -> MigrationPlan:
+         excludes=(), probe_ads: bool = True) -> MigrationPlan:
     source = Path(source)
     target = Path(target)
     mappings = mappings or {}
@@ -26,6 +26,7 @@ def scan(source, target, mappings: dict[str, str] | None = None,
     excludes = [os.path.abspath(str(item)) for item in excludes if str(item).strip()]
 
     plan = MigrationPlan(source=source, target=target, excludes=excludes)
+    plan.ads_probed = probe_ads
     totals = PlanTotals()
     link_targets: list[str] = []
     last_emit = 0.0
@@ -48,72 +49,87 @@ def scan(source, target, mappings: dict[str, str] | None = None,
     while stack:
         current = stack.pop()
         try:
-            with os.scandir(long_path(current)) as it:
-                entries = list(it)
+            it = os.scandir(long_path(current))
         except PermissionError:
             plan.permission_issues.append(current)
             plan.needs_elevation = True
             continue
         except OSError:
             continue
-
-        for entry in entries:
-            if is_excluded(entry.path, excludes):
-                plan.excluded.append(rel_to(entry.path, source))
-                continue
-            try:
-                st = os.lstat(entry.path)
-            except OSError:
-                continue
-            rel = rel_to(entry.path, source)
-            kind = reparse_kind(st)
-
-            if is_link_kind(kind):
+        # 惰性迭代，不先 list(it)：单个目录有几十万条目时，把整份清单物化下来
+        # 只是白白制造一波内存峰值。句柄在 with 里关掉；遍历期间只把子目录压栈、
+        # 不递归，所以不会同时开着一堆目录句柄。
+        with it:
+            while True:
                 try:
-                    raw = os.readlink(entry.path)
+                    entry = next(it)
+                except StopIteration:
+                    break
+                except OSError:
+                    # 目录读到一半出错（网络盘断开、条目被并发删掉）：保留已经扫到的
+                    # 部分就跳出这个目录。旧写法靠 list(it) 那层的 except 兜住，
+                    # 换成惰性迭代后必须在这里兜，否则一个坏条目会把整趟扫描带崩。
+                    break
+                if is_excluded(entry.path, excludes):
+                    plan.excluded.append(rel_to(entry.path, source))
+                    continue
+                try:
+                    st = os.lstat(entry.path)
                 except OSError:
                     continue
-                resolved = linker.resolve_target(
-                    raw, entry.path, str(source), str(target), mappings)
-                is_dir = kind in (EntryKind.JUNCTION, EntryKind.SYMLINK_DIR)
-                plan.links.append(LinkPlan(rel=rel, kind=kind, raw_target=raw,
-                                           new_target=resolved.new_target,
-                                           target_class=resolved.target_class,
-                                           is_dir=is_dir,
-                                           is_dangling=resolved.is_dangling))
-                if kind is EntryKind.SYMLINK_FILE:
-                    # 只有**文件**符号链接非特权不可：目录符号链接能降级成 junction。
-                    plan.file_symlinks += 1
-                if resolved.target_class is LinkTargetClass.OUTSIDE_SOURCE:
-                    link_targets.append(resolved.origin_target)
-                emit(rel)
-                continue
+                rel = rel_to(entry.path, source)
+                kind = reparse_kind(st)
 
-            if kind is EntryKind.UNKNOWN_REPARSE:
-                # 云占位符、AppExecLink、Dedup 这类都带真实数据语义，
-                # 默认当内容复制；跳过它们就等于把唯一副本留在备份里等删。
-                is_dir = bool(st.st_file_attributes & stat.FILE_ATTRIBUTE_DIRECTORY)
-                plan.unknown_reparse.append(
-                    UnknownReparse(rel=rel, tag=getattr(st, "st_reparse_tag", 0),
-                                   is_dir=is_dir))
-                emit(rel)
-                if skip_unknown_reparse:
+                if is_link_kind(kind):
+                    try:
+                        raw = os.readlink(entry.path)
+                    except OSError:
+                        continue
+                    resolved = linker.resolve_target(
+                        raw, entry.path, str(source), str(target), mappings)
+                    is_dir = kind in (EntryKind.JUNCTION, EntryKind.SYMLINK_DIR)
+                    plan.links.append(LinkPlan(rel=rel, kind=kind, raw_target=raw,
+                                               new_target=resolved.new_target,
+                                               target_class=resolved.target_class,
+                                               is_dir=is_dir,
+                                               is_dangling=resolved.is_dangling))
+                    if kind is EntryKind.SYMLINK_FILE:
+                        # 只有**文件**符号链接非特权不可：目录符号链接能降级成 junction。
+                        plan.file_symlinks += 1
+                    if resolved.target_class is LinkTargetClass.OUTSIDE_SOURCE:
+                        link_targets.append(resolved.origin_target)
+                    emit(rel)
                     continue
+
+                if kind is EntryKind.UNKNOWN_REPARSE:
+                    # 云占位符、AppExecLink、Dedup 这类都带真实数据语义，
+                    # 默认当内容复制；跳过它们就等于把唯一副本留在备份里等删。
+                    is_dir = bool(st.st_file_attributes & stat.FILE_ATTRIBUTE_DIRECTORY)
+                    plan.unknown_reparse.append(
+                        UnknownReparse(rel=rel, tag=getattr(st, "st_reparse_tag", 0),
+                                       is_dir=is_dir))
+                    emit(rel)
+                    if skip_unknown_reparse:
+                        continue
+                    if is_dir:
+                        totals.dirs += 1
+                    else:
+                        totals.files += 1
+                        totals.bytes += int(st.st_size)
+                    continue
+
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue                # 遍历途中消失或读不到，跳过即可
                 if is_dir:
                     totals.dirs += 1
+                    stack.append(entry.path)
                 else:
                     totals.files += 1
                     totals.bytes += int(st.st_size)
-                continue
-
-            if entry.is_dir(follow_symlinks=False):
-                totals.dirs += 1
-                stack.append(entry.path)
-            else:
-                totals.files += 1
-                totals.bytes += int(st.st_size)
-                _note_lossy_attributes(plan, entry.path, st)
-                emit(rel)
+                    _note_lossy_attributes(plan, entry.path, st, probe_ads)
+                    emit(rel)
 
     plan.totals = totals
     plan.required_bytes = totals.bytes
@@ -128,20 +144,21 @@ def scan(source, target, mappings: dict[str, str] | None = None,
     return plan
 
 
-def _note_lossy_attributes(plan: MigrationPlan, path, st) -> None:
+def _note_lossy_attributes(plan: MigrationPlan, path, st, probe_ads: bool = True) -> None:
     """记下复制保不住的三类属性：稀疏、硬链接、附加数据流。
 
     「读字节再写出」这种复制方式对它们无一例外是破坏性的：稀疏文件的空洞被实化、
     硬链接拆成彼此独立的副本、ADS 干脆不带走。三样都不会报错，复制照样成功，
     所以只能在这里数出来提前说，否则用户看到「校验通过」会以为一个字节都没变。
 
-    稀疏与硬链接复用 lstat 已经带回来的信息，零额外开销；ADS 要多问一次文件系统，
-    这是扫描里唯一新增的每文件调用——下载来的文件普遍带 Zone.Identifier，
-    不说清楚代价更大。
+    稀疏与硬链接复用 lstat 已经带回来的信息，零额外开销；ADS 要多问一次文件系统
+    （FindFirstStreamW），**这是整个扫描里唯一新增的每文件调用**——几十万个文件下
+    是可测的常数开销，所以留了 probe_ads 开关（命令行 --no-ads-scan）。关掉时
+    ads_files 恒为 0，plan.ads_probed 会如实记为 False，不会把「没问过」当成「没有」。
     """
     if is_sparse(st):
         plan.sparse_files += 1
     if is_hardlinked(st):
         plan.hardlinked_files += 1
-    if has_alternate_streams(path):
+    if probe_ads and has_alternate_streams(path):
         plan.ads_files += 1

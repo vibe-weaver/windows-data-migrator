@@ -4,6 +4,7 @@ import pytest
 from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
 from PySide6.QtGui import QDropEvent
 
+from dmig.core import fsutil
 from dmig.ui import select_page
 from dmig.ui.select_page import PathLineEdit, SelectPage, free_space_text
 
@@ -75,6 +76,37 @@ def test_empty_selection_shows_hint(page):
 
 def test_free_space_text_handles_missing_path():
     assert free_space_text("") == "-"
+
+
+def test_free_space_text_is_served_from_the_volume_cache(tmp_path, monkeypatch):
+    """每敲一个字符就刷一次剩余空间：同一卷在缓存窗口内不该反复问文件系统。"""
+    fsutil.clear_free_cache()
+    calls: list[int] = []
+
+    def fake(path):
+        calls.append(1)
+        return 2048
+
+    monkeypatch.setattr(fsutil, "volume_free_bytes", fake)
+    try:
+        assert free_space_text(str(tmp_path)) == "2.0 KB"
+        free_space_text(str(tmp_path / "其它目录"))
+        assert len(calls) == 1
+    finally:
+        fsutil.clear_free_cache()
+
+
+def test_free_space_text_shows_dash_when_unavailable(tmp_path, monkeypatch):
+    fsutil.clear_free_cache()
+
+    def boom(path):
+        raise OSError("盘不见了")
+
+    monkeypatch.setattr(fsutil, "volume_free_bytes", boom)
+    try:
+        assert free_space_text(str(tmp_path)) == "-"
+    finally:
+        fsutil.clear_free_cache()
 
 
 def test_path_edit_accepts_dropped_url(qtbot, tmp_path):

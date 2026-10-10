@@ -13,6 +13,7 @@ from . import guard, linker, locks, permission, reparse, scanner, verifier
 from .copier import run as copy_run
 from .fsutil import is_inside, is_link_kind, long_path, reparse_kind, strip_long_prefix
 from .models import CopyResult, MigrationPlan, VerifyResult
+from .runlog import LOG_SUFFIX, RunLog
 from .session import Session
 
 # 改名要独占整棵树，而冲突（资源管理器开着子目录、终端 cwd 在里面、杀软在扫）
@@ -76,6 +77,9 @@ class MigrateOutcome:
     # 按排除项跳过的条目。它们没复制到目标、迁移后只存在于备份里，
     # 报告要逐条列出：删备份前用户得有据可查。
     excluded: list[str] = field(default_factory=list)
+    # 这趟运行的日志文件（`<会话>.log`）。失败现场往往已经变了，
+    # 光看结构化数据回答不了「几个小时里走到了哪一步」。
+    log_path: str = ""
 
 
 def _same_path(a, b) -> bool:
@@ -126,7 +130,8 @@ class Migrator:
     """一次迁移任务的完整生命周期。"""
 
     def __init__(self, source, target, *, mappings=None, deep_verify=False,
-                 session_root=None, skip_unknown_reparse=False, excludes=None):
+                 session_root=None, skip_unknown_reparse=False, excludes=None,
+                 probe_ads=True):
         self.source = Path(source)
         self.target = Path(target)
         self.mappings = dict(mappings or {})
@@ -134,11 +139,72 @@ class Migrator:
         self.session_root = session_root
         self.skip_unknown_reparse = skip_unknown_reparse
         self.excludes = [str(item) for item in (excludes or [])]
+        self.probe_ads = probe_ads
         self.plan: MigrationPlan | None = None
         self.session: Session | None = None
         self.backup_path: str | None = None
         self.cleanup_error: str = ""
         self._link_created = False
+        self.runlog: RunLog | None = None
+
+    # --- 日志 -------------------------------------------------------
+    def _ensure_runlog(self) -> None:
+        """会话一旦就位，就把日志挂到它旁边（`<id>.log`，与 `.json`/`.done` 同前缀）。"""
+        if self.session is not None and self.runlog is None:
+            self.runlog = RunLog(self.session.path.with_suffix(LOG_SUFFIX))
+
+    def _log(self, message: str) -> None:
+        if self.runlog is not None:
+            self.runlog.write(message)
+
+    def _log_start(self) -> None:
+        self._log(f"开始一趟：{self.source} → {self.target}")
+        self._log(f"参数：{self.run_options()}")
+        plan = self.plan
+        if plan is None:
+            return
+        self._log(f"扫描：files={plan.totals.files} dirs={plan.totals.dirs} "
+                  f"bytes={plan.required_bytes} links={len(plan.links)} "
+                  f"unknown_reparse={len(plan.unknown_reparse)} "
+                  f"permission_issues={len(plan.permission_issues)}")
+        self._log(f"属性：sparse={plan.sparse_files} "
+                  f"hardlinked={plan.hardlinked_files} ads={plan.ads_files} "
+                  f"（ads_probed={plan.ads_probed}）")
+        if plan.excluded:
+            self._log(f"排除：{len(plan.excluded)} 项，前几项 {plan.excluded[:5]}")
+        dangling = [link.rel for link in plan.links if link.is_dangling]
+        if dangling:
+            self._log(f"断链：{len(dangling)} 条，前几条 {dangling[:5]}")
+
+    def _log_outcome(self, outcome: MigrateOutcome) -> None:
+        """把这一趟的结论一次记全（挂在唯一出口上，不必逐个返回点去写）。"""
+        log = self.runlog
+        if log is None:
+            return
+        copy = outcome.copy
+        if copy is not None:
+            log.write(f"复制：copied={copy.copied_files} bytes={copy.copied_bytes} "
+                      f"skipped={copy.skipped} cancelled={copy.cancelled} "
+                      f"aborted={copy.aborted or '-'}")
+            if copy.failures:
+                log.failures("复制失败", [f"{f.rel}（{f.reason} {f.process}）".strip()
+                                        for f in copy.failures])
+            if copy.dir_times_failed:
+                log.failures("目录时间戳未写回", copy.dir_times_failed)
+        verify = outcome.verify
+        if verify is not None:
+            log.write(f"校验：ok={verify.ok} expected={verify.expected_files} "
+                      f"actual={verify.actual_files} missing={len(verify.missing)} "
+                      f"mismatch={len(verify.mismatch)}")
+            if verify.missing:
+                log.failures("校验缺失", verify.missing)
+            if verify.mismatch:
+                log.failures("校验不一致", verify.mismatch)
+        if outcome.backup_path:
+            log.write(f"备份：{outcome.backup_path}")
+        if outcome.link_kind:
+            log.write(f"源目录链接：{outcome.link_kind}")
+        log.write(f"结果：ok={outcome.ok} phase={outcome.phase} {outcome.message}".rstrip())
 
     # --- 会话 -------------------------------------------------------
     def adopt_session(self, sess: Session | None) -> bool:
@@ -171,13 +237,15 @@ class Migrator:
         return {"mappings": dict(self.mappings),
                 "deep_verify": self.deep_verify,
                 "skip_unknown_reparse": self.skip_unknown_reparse,
-                "excludes": list(self.excludes)}
+                "excludes": list(self.excludes),
+                "probe_ads": self.probe_ads}
 
     def plan_it(self, on_progress=None) -> MigrationPlan:
         self.plan = scanner.scan(self.source, self.target,
                                  mappings=self.mappings, on_progress=on_progress,
                                  skip_unknown_reparse=self.skip_unknown_reparse,
-                                 excludes=self.excludes)
+                                 excludes=self.excludes,
+                                 probe_ads=self.probe_ads)
         return self.plan
 
     def guard_errors(self) -> list[str]:
@@ -237,6 +305,13 @@ class Migrator:
             else:
                 failed.append(path)
         self.session.save()
+        self._ensure_runlog()
+        self._log(f"接管属主：{taken} 个目录成功、{len(failed)} 个失败"
+                  + (f"，失败示例 {failed[:3]}" if failed else ""))
+        for item in self.session.acl_backup:
+            if not item.get("sddl"):
+                self._log(f"接管属主：{item.get('path')} 的原始 ACL 没能读出，"
+                          f"回滚时不会还原它的权限")
 
         # 权限变了，旧计划作废：不重扫的话界面还停在「无权限」那一份上，
         # 用户点「开始迁移」会立刻又被同一条校验拦下。
@@ -311,6 +386,9 @@ class Migrator:
         outcome = self._execute(on_progress=on_progress,
                                 should_cancel=should_cancel,
                                 should_pause=should_pause)
+        # 日志同样挂在唯一出口上；这一趟才新建的会话要到这时候才能挂。
+        self._ensure_runlog()
+        self._log_outcome(outcome)
         # 链接清单与属性计数都挂在唯一出口上：_execute 有十来个返回点，逐个补必然漏。
         if self.session is not None:
             outcome.links = list(self.session.links)
@@ -319,6 +397,8 @@ class Migrator:
             outcome.hardlinked_files = self.plan.hardlinked_files
             outcome.ads_files = self.plan.ads_files
             outcome.excluded = list(self.plan.excluded)
+        if self.runlog is not None:
+            outcome.log_path = str(self.runlog.path)
         return outcome
 
     def _execute(self, *, on_progress=None, should_cancel=None,
@@ -361,6 +441,8 @@ class Migrator:
         self.session.totals = {"files": self.plan.totals.files,
                                "bytes": self.plan.totals.bytes}
         self.session.options = self.run_options()
+        self._ensure_runlog()
+        self._log_start()
 
         # ③ 复制
         copy_result = copy_run(self.plan, self.session, on_progress=on_progress,
@@ -475,6 +557,8 @@ class Migrator:
         """
         if not awaiting_source_link(self.session, self.source):
             return None
+        self._ensure_runlog()
+        self._log(f"会话停在改名之后：只补建源目录链接（备份 {self.session.backup_path}）")
         self.backup_path = self.session.backup_path or self.backup_path
         kind, phase, detail = self._create_source_link()
         self.session.phase = phase
@@ -559,8 +643,10 @@ class Migrator:
     def cleanup_backup(self, force: bool = False) -> bool:
         """删除备份。返回是否**真的删干净了**，原因写在 cleanup_error。"""
         self.cleanup_error = ""
+        self._ensure_runlog()
         if not self.backup_path or not os.path.exists(long_path(self.backup_path)):
             self.cleanup_error = "没有可删除的备份"
+            self._log(f"删除备份：被拒（{self.cleanup_error}）")
             return False
 
         held: list[str] = []
@@ -574,6 +660,7 @@ class Migrator:
             self.cleanup_error = (
                 f"备份里有{('；'.join(held))}，它们只存在于备份里，"
                 f"删掉备份就会永久消失。确认这些内容不再需要后，再强制删除。")
+            self._log(f"删除备份：被拒（{self.cleanup_error}）")
             return False
 
         leftovers = rmtree_force(long_path(self.backup_path))
@@ -582,11 +669,13 @@ class Migrator:
             self.cleanup_error = (
                 f"备份未能完全删除（{len(leftovers)} 项删不掉：{sample}），"
                 f"目录仍在：{self.backup_path}")
+            self._log(f"删除备份：未删干净，{self.cleanup_error}")
             return False
 
         if self.session:
             self.session.phase = "cleaned"
             self.session.save()
+        self._log(f"删除备份：完成（force={force}）{self.backup_path}")
         return True
 
     def discard_target(self) -> bool:
@@ -597,15 +686,19 @@ class Migrator:
         源目录已经是指向目标的链接时，目标就是活数据，删掉等于把迁移成果清空。
         """
         self.cleanup_error = ""
+        self._ensure_runlog()
         if is_reparse_path(self.source):
             self.cleanup_error = "源目录已经是指向目标的链接，目标端是活数据，不能删"
+            self._log(f"删除目标：被拒（{self.cleanup_error}）")
             return False
         backup_ok = bool(self.backup_path) and os.path.exists(long_path(self.backup_path))
         if not os.path.isdir(long_path(self.source)) and not backup_ok:
             self.cleanup_error = "源目录与备份都不在，无法确认数据另有副本，拒绝删除目标"
+            self._log(f"删除目标：被拒（{self.cleanup_error}）")
             return False
         if not os.path.exists(long_path(self.target)):
             self.cleanup_error = "目标目录不存在，无需清理"
+            self._log(f"删除目标：被拒（{self.cleanup_error}）")
             return False
 
         leftovers = rmtree_force(long_path(self.target))
@@ -614,11 +707,13 @@ class Migrator:
             self.cleanup_error = (
                 f"目标目录未能完全删除（{len(leftovers)} 项删不掉：{sample}），"
                 f"目录仍在：{self.target}")
+            self._log(f"删除目标：未删干净，{self.cleanup_error}")
             return False
 
         if self.session:
             self.session.phase = "discarded"
             self.session.save()
+        self._log(f"删除目标：完成 {self.target}")
         return True
 
     def rollback(self) -> bool:
@@ -628,6 +723,7 @@ class Migrator:
         等于把用户的权限配置永久改掉了。
         """
         self.cleanup_error = ""
+        self._ensure_runlog()
         acl_failed = self._restore_acl()
         if acl_failed:
             preview = "；".join(acl_failed[:3])
@@ -641,13 +737,17 @@ class Migrator:
                 try:
                     os.unlink(long_path(self.source))
                 except OSError:
+                    self._log("回滚：摘掉源目录链接失败")
                     return False
         if self.backup_path and os.path.exists(long_path(self.backup_path)):
             try:
                 os.rename(long_path(self.backup_path), long_path(self.source))
             except OSError:
+                self._log(f"回滚：备份改回原名失败 {self.backup_path}")
                 return False
         if self.session:
             self.session.phase = "rolled_back"
             self.session.save()
+        self._log(f"回滚：完成 {self.source}" + (f"；{self.cleanup_error}"
+                                                if self.cleanup_error else ""))
         return True

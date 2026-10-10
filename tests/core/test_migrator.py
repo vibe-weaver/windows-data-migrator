@@ -567,7 +567,8 @@ def test_execute_records_the_run_options(tmp_path):
     assert reloaded.options == {"mappings": {str(ext): str(moved)},
                                 "deep_verify": True,
                                 "skip_unknown_reparse": False,
-                                "excludes": []}
+                                "excludes": [],
+                                "probe_ads": True}
 
 
 # --- C6：会话停在改名之后 ---------------------------------------------
@@ -1045,4 +1046,75 @@ def test_reverify_catches_a_same_size_change(tmp_path):
 
     baseline, _ = m.reverify_baseline()
     assert migrator_mod.verifier.verify(baseline, m.target).ok is False
+
+
+# --- D8：运行日志 -----------------------------------------------------
+def _log_text(outcome) -> str:
+    with open(outcome.log_path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def test_run_log_records_the_whole_run(tmp_path):
+    """失败现场往往已经变了（源被改名成备份），复盘全过程只能靠这份日志。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+
+    assert out.log_path == str(m.session.path.with_suffix(".log"))
+    assert os.path.exists(out.log_path)
+    text = _log_text(out)
+    for needle in ("开始一趟", "参数：", "扫描：files=2", "复制：copied=2",
+                   "校验：ok=True", "备份：", "源目录链接：junction",
+                   "结果：ok=True phase=done"):
+        assert needle in text, f"日志缺 {needle}：\n{text}"
+
+
+def test_run_log_names_the_failed_items(tmp_path, monkeypatch):
+    """失败项要落进日志，否则只能去翻会话 JSON 才知道是哪个文件。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    monkeypatch.setattr("dmig.core.migrator.verifier.verify",
+                        lambda *a, **k: __import__("dmig.core.models", fromlist=["VerifyResult"])
+                        .VerifyResult(ok=False, missing=["two.bin"]))
+    out = m.execute()
+    assert out.phase == "verify_failed"
+
+    text = _log_text(out)
+    assert "校验：ok=False" in text
+    assert "校验缺失：1 项" in text
+    assert "two.bin" in text
+    assert "结果：ok=False phase=verify_failed" in text
+
+
+def test_run_log_accumulates_instead_of_overwriting(tmp_path):
+    """续传沿用同一个会话，日志也接着写——抹掉上一趟等于丢掉现场。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    assert m.execute().ok
+
+    second = _migrator(tmp_path, src)
+    assert second.adopt_session(Session.load(m.session.path)) is True
+    out = second.execute()
+    assert out.ok is False                       # 源已是指向目标的链接，前置校验会拒绝
+
+    text = _log_text(out)
+    assert text.count("结果：") >= 2
+
+
+def test_rollback_and_cleanup_leave_a_log_line(tmp_path):
+    """回滚与删备份都是破坏性动作，事后必须查得到「谁做的、做成没有」。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+
+    assert m.cleanup_backup() is True
+    text = _log_text(out)
+    assert "删除备份：完成" in text
+
+    log_path = out.log_path
+    assert m.rollback() is True
+    with open(log_path, encoding="utf-8") as handle:
+        assert "回滚：完成" in handle.read()
 

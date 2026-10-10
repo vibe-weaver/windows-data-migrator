@@ -102,6 +102,9 @@ class MigrationPlan:
     sparse_files: int = 0
     hardlinked_files: int = 0
     ads_files: int = 0
+    # ADS 是三类里唯一要额外问一次文件系统的（FindFirstStreamW，每文件一次）。
+    # 关掉探测时 ads_files 恒为 0，必须靠这个字段把「没有」和「没问过」分开。
+    ads_probed: bool = True
 
 
 def lossy_attribute_text(sparse: int, hardlinks: int, ads: int) -> str:

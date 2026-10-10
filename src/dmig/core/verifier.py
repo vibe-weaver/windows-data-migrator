@@ -14,15 +14,14 @@ from .models import Progress, VerifyResult
 PROGRESS_INTERVAL = 0.1
 
 
-def sha256_of(path, block: int = 1 << 20) -> str:
-    digest = hashlib.sha256()
+def sha256_of(path) -> str:
+    """整文件 SHA-256。
+
+    用 hashlib.file_digest 而不是自己按块读：读与摘要都走 C 层，
+    省掉每 1MB 一次 Python 层的 read/update 循环——deep 校验可能读几十 GB。
+    """
     with open(long_path(path), "rb") as fh:
-        while True:
-            chunk = fh.read(block)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
+        return hashlib.file_digest(fh, "sha256").hexdigest()
 
 
 def is_reparse_point(path) -> bool:

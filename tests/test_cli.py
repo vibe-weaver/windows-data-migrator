@@ -79,6 +79,41 @@ def test_scan_discloses_attributes_copy_cannot_preserve(tmp_path, capsys):
     assert "2 个硬链接会变成各自独立的副本" in captured.err
 
 
+def test_scan_can_skip_the_ads_probe(tmp_path, capsys):
+    """D1：ADS 探测是每文件一次额外系统调用，要能关，且不能把「没问过」说成 0。"""
+    src = _tree(tmp_path)
+    rc = cli.main(["scan", "--source", str(src), "--target", str(tmp_path / "dst"),
+                   "--no-ads-scan"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["lossy_attributes"]["ads_files"] == 0
+    assert payload["lossy_attributes"]["ads_probed"] is False
+    assert "没有探测附加数据流" in captured.err
+
+
+def test_scan_probes_ads_by_default(tmp_path, capsys):
+    src = _tree(tmp_path)
+    rc = cli.main(["scan", "--source", str(src), "--target", str(tmp_path / "dst")])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["lossy_attributes"]["ads_probed"] is True
+
+
+def test_migrate_prints_the_run_log_path(tmp_path, capsys):
+    """D8：失败现场往往已经变了，日志路径要直接给出来。"""
+    src = _tree(tmp_path)
+    rc = cli.main(["migrate", "--source", str(src), "--target", str(tmp_path / "dst"),
+                   "--yes", "--keep-backup"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "运行日志：" in captured.out
+    log_path = [line for line in captured.out.splitlines()
+                if line.startswith("运行日志：")][0].split("：", 1)[1]
+    assert os.path.exists(log_path)
+    with open(log_path, encoding="utf-8") as handle:
+        assert "结果：ok=True phase=done" in handle.read()
+
+
 def test_migrate_dry_run_does_not_touch_sources(tmp_path, capsys):
     src = _tree(tmp_path)
     rc = cli.main(["migrate", "--source", str(src), "--target", str(tmp_path / "dst"),

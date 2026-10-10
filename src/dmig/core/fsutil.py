@@ -4,6 +4,7 @@ from __future__ import annotations
 import ctypes
 import os
 import stat
+import time
 
 from .models import EntryKind
 
@@ -149,6 +150,35 @@ def existing_ancestor(path) -> str:
 def volume_free_bytes(path) -> int:
     import shutil
     return shutil.disk_usage(existing_ancestor(path)).free
+
+
+_FREE_CACHE: dict[str, tuple[float, int]] = {}
+FREE_CACHE_TTL = 2.0
+
+
+def cached_free_bytes(path, ttl: float = FREE_CACHE_TTL) -> int:
+    """该路径所在卷的剩余空间，按卷根缓存 ttl 秒；查不到返回 -1。
+
+    选择页每敲一个字符就要刷一次剩余空间：卷信息（盘类型/文件系统）已经缓存了，
+    而 disk_usage 没有——网络盘或断开的映射盘上它会阻塞到超时，界面直接卡住。
+    失败结果同样缓存：失败一次就够了，不必每个按键再等一遍。
+    要拿到实时值（例如刚迁移完）就调 clear_free_cache()。
+    """
+    key = os.path.normcase(volume_root(path) or strip_long_prefix(str(path)))
+    now = time.monotonic()
+    hit = _FREE_CACHE.get(key)
+    if hit is not None and now - hit[0] < ttl:
+        return hit[1]
+    try:
+        free = volume_free_bytes(path)
+    except OSError:
+        free = -1
+    _FREE_CACHE[key] = (now, free)
+    return free
+
+
+def clear_free_cache() -> None:
+    _FREE_CACHE.clear()
 
 
 # --- 卷信息（盘类型 / 文件系统） ------------------------------------

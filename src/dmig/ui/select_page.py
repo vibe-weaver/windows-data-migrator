@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QVBoxLayout,
 import qfluentwidgets as qf
 
 from ..core import guard
-from ..core.fsutil import drive_of, volume_free_bytes
+from ..core.fsutil import cached_free_bytes
 from . import chrome
 from .format import human_bytes
 from .theme import SUCCESS
@@ -58,15 +58,15 @@ class PathLineEdit(qf.LineEdit):
 
 
 def free_space_text(path: str) -> str:
-    """该路径所在卷的剩余空间；取不到返回 "-"。"""
+    """该路径所在卷的剩余空间；取不到返回 "-"。
+
+    走 cached_free_bytes：按卷根缓存两秒，避免每敲一个字符都去问一次文件系统
+    （网络盘或断开的映射盘上那一下会阻塞到超时）。
+    """
     if not path:
         return "-"
-    try:
-        drive = drive_of(path)
-        root = drive + "\\" if drive else path
-        return human_bytes(volume_free_bytes(root))
-    except OSError:
-        return "-"
+    free = cached_free_bytes(path)
+    return human_bytes(free) if free >= 0 else "-"
 
 
 class SelectPage(QWidget):
