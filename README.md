@@ -4,7 +4,42 @@
 
 > 搬走数据，留下链接。
 
+![平台](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows%2010%20%7C%2011-0078D4)
+![许可](https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF-MIT-3DA639)
+[![最新版本](https://img.shields.io/github/v/release/vibe-weaver/windows-data-migrator?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC)](../../releases/latest)
+![免安装](https://img.shields.io/badge/%E7%BB%BF%E8%89%B2-%E5%85%8D%E5%AE%89%E8%A3%85-6E7681)
+
 ![界面](docs/brand/window.png)
+
+## 三步上手
+
+1. 到 [Releases](../../releases/latest) 下载 zip，解压
+2. 双击 `Windows数据迁移助手.exe`
+3. 选源目录和目标目录 → **点「开始检验」** → 一路下一步
+
+**第二步里那次「开始检验」别跳过。** 它用一次几毫秒的试探改名，提前回答「现在有没有程序占着源目录」——
+这是唯一一个会等到最后一步才炸的错误：复制校验全跑完、你已经等了几个小时，才卡在改名上。
+
+## 下载
+
+| 从哪下 | 地址 |
+|---|---|
+| 官方 | [Releases](../../releases/latest) |
+| 国内镜像 | 直连 GitHub 在国内经常超时，在地址前加 `https://gh-proxy.com/` 即可：<br>`https://gh-proxy.com/https://github.com/vibe-weaver/windows-data-migrator/releases/download/v1.0.0/windows-data-migrator-1.0.0-win64.zip` |
+
+解压后双击里面的 `Windows数据迁移助手.exe`（文件夹名是中文的，zip 名是 ASCII 的——中文文件名在镜像站和下载工具里容易出问题）。
+
+**绿色免安装**：不写注册表，删掉文件夹就是卸载。
+
+详细用法见压缩包里的 **`使用说明书.html`**（双击用浏览器打开）。
+
+## 它和「剪切粘贴」「手动 mklink」的区别
+
+| 做法 | 问题 |
+|---|---|
+| 剪切粘贴到别的盘 | 原路径没了，任何按原路径找数据的程序立刻报错 |
+| 手动 `mklink /J` | 得先复制、再改名、再建链接，中途失败就两头不着；而且**会顺手把链接指向的远端仓库数据也复制一遍** |
+| **本工具** | 复制 → **逐个文件校验** → 改名 → 建链接，四步都可回退；树里的链接只重建链接本身，不搬远端数据 |
 
 ## 先读这段：它会动你的数据，也会关你的程序
 
@@ -20,13 +55,6 @@
 - **系统关键进程、桌面外壳、安全软件、工具自己，一律不关**，并且会写明理由请你手动处理。
 
 源码在仓库里，可以直接核对上述任何一条。
-
-## 下载
-
-到 [Releases](../../releases) 下载 `Windows数据迁移助手-1.0.0-win64.zip`，解压后双击里面的
-`Windows数据迁移助手.exe`。**绿色免安装**，不写注册表，删掉文件夹就是卸载。
-
-详细用法见压缩包里的 **`使用说明书.html`**（双击用浏览器打开）。
 
 ## 界面总览
 
@@ -203,6 +231,53 @@ python app.py discard %LOCALAPPDATA%\DataMigrationTool\sessions\<id>.json --yes
 
 `scan` 同样接受 `--exclude`；计划 JSON 里会给出 `excluded`（实际跳过的条目）、
 `dangling_links`（断链）与 `lossy_attributes`（保不住的属性计数）。
+
+## 常见问题
+
+<details>
+<summary><b>迁移到一半取消了，白干了吗？</b></summary>
+
+没有。已完成的文件都记在会话里（`%LOCALAPPDATA%\DataMigrationTool\sessions\`），
+重新选中同一个会话会从断点继续，已完成且未改动的文件直接跳过。
+</details>
+
+<details>
+<summary><b>怎么判断备份能不能删？</b></summary>
+
+判据是「你是否确定不再需要退回迁移前的状态」，**不是「是否已经手动验证过」**。
+回滚必须依靠备份文件，删掉就再也回不去了。报告页顶部有一条常驻警告写着备份路径。
+</details>
+
+<details>
+<summary><b>它提示「改不了名，但查不出占用者」，是怎么回事？</b></summary>
+
+有程序把**源目录本身**当工作目录了——资源管理器开着那个文件夹，或者某个终端 `cd` 在里面。
+这类占用挡得住改名，但系统接口拿不到那个进程。手动关掉那些窗口再重新扫描即可。
+</details>
+
+<details>
+<summary><b>目标盘上已经有同名文件怎么办？</b></summary>
+
+按「合并/续传」处理：已完成且大小与时间戳一致的文件跳过，其余覆盖。
+目标端**不属于这次迁移**的内容不会被删——回滚时清目标端也会先检查这一点。
+</details>
+
+<details>
+<summary><b>杀毒软件报毒怎么办？</b></summary>
+
+PyInstaller 打包、无数字签名的 exe，加上「遍历全盘 + 改名目录 + 建链接 + 关闭进程」
+这类行为，**很可能被误报**。源码就在仓库里，可以核对该程序实际做了什么；
+也可以用 `packaging/build.ps1` 自行构建。遇到具体误报欢迎开 issue 附上引擎名称与截图。
+</details>
+
+<details>
+<summary><b>还有哪些限制？</b></summary>
+
+- **目录句柄占用查不出进程**：见上
+- **稀疏文件会变实占**：动态 VHD 这类文件复制到目标端会占用完整大小（计划页的空间需求按逻辑大小算，与之一致）
+- **同盘迁移不释放空间**：源与目标同卷时会有黄色警告
+- 完整清单见压缩包里的 `使用说明书.html`
+</details>
 
 ## 开发
 

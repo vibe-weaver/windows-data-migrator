@@ -75,7 +75,7 @@ def test_zip_keeps_the_top_level_folder(tmp_path):
     (app / "_internal").mkdir(parents=True)
     (app / "Windows数据迁移助手.exe").write_bytes(b"MZ" + b"\0" * 100)
     (app / "_internal" / "python313.dll").write_bytes(b"\0" * 500)
-    out = tmp_path / "Windows数据迁移助手-1.0.0-win64.zip"
+    out = tmp_path / "windows-data-migrator-1.0.0-win64.zip"
 
     assert make_zip.main(app, out) == 0
 

@@ -115,7 +115,11 @@ Write-Host '== 6/6 压缩成可直接发送的 zip =='
 # 收件人需要的是整个文件夹（单独把 exe 拿出去跑不起来），
 # 所以分发的单位是 zip 而不是 exe。
 $appDir = Join-Path $dist $appName
-$zip = Join-Path $dist "$appName-$appVersion-win64.zip"
+# zip 用 **ASCII** 名，目录和 exe 保持中文。
+# 实测：中文资产名传到 GitHub Release 时，中文字符会被整个丢掉，
+# 变成 Windows.-1.0.0-win64.zip。镜像站与下载工具对中文文件名也普遍不友好，
+# 所以**对外分发的文件名一律 ASCII**，用户解压之后看到的仍是中文目录名。
+$zip = Join-Path $dist "windows-data-migrator-$appVersion-win64.zip"
 
 # 闸门放在压缩【之前】：万一 PyInstaller 以 0 退出却没有真正刷新产物
 # （缓存、并发写入、路径搞错……），退出码检查发现不了，比时间戳能兜住。
