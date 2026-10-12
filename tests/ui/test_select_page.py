@@ -5,7 +5,7 @@ from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
 from PySide6.QtGui import QDropEvent
 
 from dmig.core import fsutil
-from dmig.ui import select_page
+from dmig.ui import select_page, theme
 from dmig.ui.select_page import PathLineEdit, SelectPage, free_space_text
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows")
@@ -35,7 +35,7 @@ def test_same_volume_pair_is_flagged_but_not_blocked(page, tmp_path):
     page.refresh_check()
     assert page.has_blocking_error() is False
     assert "same_volume" in {i.code for i in page.issues()}
-    assert "[提示] 源与目标在同一个卷" in page.issues_text()
+    assert "[警告] 源与目标在同一个卷" in page.issues_text()
 
 
 def test_clean_pair_shows_the_pass_hint(page, tmp_path, monkeypatch):
@@ -131,3 +131,128 @@ def test_changed_signal_fires_on_set(page, tmp_path):
     page.set_source(str(tmp_path))
     page.set_target(str(tmp_path / "dst"))
     assert len(seen) >= 2
+
+
+# --- 校验只由「开始检验」触发 -----------------------------------------
+
+def test_editing_a_path_does_not_run_the_check(page, tmp_path, monkeypatch):
+    """改路径不该自动跑校验。
+
+    自动跑的那一遍里**没有试探改名**——而改名失败恰恰是最容易让整趟迁移白跑的
+    风险（复制校验全过、卡在最后一步）。一边只查了一半、一边给出绿色的
+    「前置校验通过」，比什么都不给更误导。
+    """
+    calls = []
+    monkeypatch.setattr(select_page.guard, "check",
+                        lambda *a, **kw: calls.append(a) or [])
+    src = tmp_path / "a"
+    src.mkdir()
+
+    page.set_source(str(src))
+    page.set_target(str(tmp_path / "b"))
+
+    assert calls == [], "改路径触发了自动校验"
+
+
+def test_unchecked_state_says_so_instead_of_showing_a_pass(page, tmp_path):
+    """选好目录但还没检验时，给中性指引，不能给绿色结论。"""
+    src = tmp_path / "a"
+    src.mkdir()
+    page.set_source(str(src))
+    page.set_target(str(tmp_path / "b"))
+
+    assert page.is_checked() is False
+    assert page.has_blocking_error() is False
+    assert "开始检验" in page.issues_text()
+    assert "通过" not in page.issues_text()
+
+
+def test_editing_after_a_check_invalidates_it(page, tmp_path, monkeypatch):
+    """检验过之后改了路径，那份结论就作废——它说的是另一条路径。"""
+    src = tmp_path / "a"
+    src.mkdir()
+    other = tmp_path / "b"
+    other.mkdir()
+    monkeypatch.setattr(select_page.guard, "check", lambda *a, **kw: [])
+    monkeypatch.setattr(select_page.guard, "probe_rename", lambda s: [])
+
+    page.set_source(str(src))
+    page.set_target(str(tmp_path / "dst"))
+    page.run_probe()
+    assert page.is_checked() is True
+
+    page.set_source(str(other))
+
+    assert page.is_checked() is False
+    assert "通过" not in page.issues_text()
+
+
+# --- 检验按钮：试探改名 + 原有前置校验 ---------------------------------
+
+def test_check_button_asks_the_window_to_run_the_check(page):
+    """页面只发信号，跑检查这件事由窗口决定（和 plan_page 的 replan 一个路数）。"""
+    seen = []
+    page.check_requested.connect(lambda: seen.append(1))
+    page.check_button.click()
+    assert seen == [1]
+
+
+def test_run_probe_adds_a_blocking_error_when_rename_would_fail(page, tmp_path,
+                                                                monkeypatch):
+    """试探失败要变成**红色错误**，并且拦住下一步。
+
+    改名失败的门槛比复制失败低得多（任何句柄都算，连只读打开都是），
+    而它发生在整趟迁移的最后一步——所以要在第一步就拦住。
+    """
+    src = tmp_path / "a"
+    src.mkdir()
+    monkeypatch.setattr(select_page.guard, "check", lambda *a, **kw: [])
+    monkeypatch.setattr(select_page.guard, "probe_rename", lambda s: [
+        select_page.guard.Issue("rename_blocked", "源目录无法改名：拒绝访问",
+                                severity="error")])
+
+    page.set_source(str(src))
+    page.set_target(str(tmp_path / "b"))
+    page.run_probe()
+
+    assert page.has_blocking_error() is True
+    assert "rename_blocked" in {i.code for i in page.issues()}
+    assert "无法改名" in page.issues_text()
+
+
+def test_probe_does_not_run_on_the_automatic_refresh(page, tmp_path, monkeypatch):
+    """自动刷新（改路径时的实时校验）**不能**跑试探。
+
+    试探有副作用：源路径会消失几毫秒、父目录 mtime 会变。每次敲键盘都触一次，
+    正开着这个目录的编辑器会不停地报「文件夹已删除」。
+    """
+    called = []
+    monkeypatch.setattr(select_page.guard, "probe_rename",
+                        lambda s: called.append(s) or [])
+    src = tmp_path / "a"
+    src.mkdir()
+
+    page.set_source(str(src))
+    page.set_target(str(tmp_path / "b"))
+    page.refresh_check()
+
+    assert called == [], "实时刷新不该触发试探"
+
+
+def test_errors_and_warnings_are_coloured_differently(page, tmp_path, monkeypatch):
+    """红色 = 错误（拦），黄色 = 警告（不拦）。"""
+    src = tmp_path / "a"
+    src.mkdir()
+    monkeypatch.setattr(select_page.guard, "check", lambda *a, **kw: [
+        select_page.guard.Issue("boom", "会拦住下一步的问题"),
+        select_page.guard.Issue("meh", "只是提醒", severity="warning"),
+    ])
+    page.set_source(str(src))
+    page.set_target(str(tmp_path / "b"))
+    page.refresh_check()
+
+    colors = page.issue_colors()
+    assert len(colors) == 2
+    assert colors[0] == theme.error_color()
+    assert colors[1] == theme.warning_color()
+    assert colors[0] != colors[1]
