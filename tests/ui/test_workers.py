@@ -31,6 +31,38 @@ class _FakeMigrator:
         return self._outcome
 
 
+def test_migrate_worker_forwards_log_lines_to_the_signal(qtbot):
+    """迁移写的每一行日志都要同时发到界面。
+
+    界面上的「迁移日志」原来只写三个事件（校验开始/复制失败/取消），一趟干净
+    成功的迁移在界面上只剩一行校验提示，而磁盘日志里十条都有。worker 把
+    migrator 的日志接收方接到自己的信号上，界面显示的才是这份日志本身。
+    """
+    migrator = _FakeMigrator(outcome="OUTCOME")
+    worker = MigrateWorker(migrator)
+    seen: list[str] = []
+    worker.logged.connect(seen.append)
+
+    assert migrator.log_sink is not None, "worker 必须把接收方挂到 migrator 上"
+
+    migrator.log_sink("[2026-01-01 00:00:00] 扫描：files=1 links=1")
+    assert seen == ["[2026-01-01 00:00:00] 扫描：files=1 links=1"]
+
+
+def test_migrate_worker_replaces_a_stale_sink(qtbot):
+    """同一个 migrator 被复用时要换成新的信号，不能把日志发给上一趟的界面。"""
+    migrator = _FakeMigrator(outcome="OUTCOME")
+    first = MigrateWorker(migrator)
+    second = MigrateWorker(migrator)
+
+    seen: list[str] = []
+    second.logged.connect(seen.append)
+    migrator.log_sink("第二趟的行")
+
+    assert seen == ["第二趟的行"]
+    assert first is not second
+
+
 def test_plan_worker_emits_plan(qtbot):
     worker = PlanWorker(_FakeMigrator(plan="PLAN"))
     with qtbot.waitSignal(worker.planned, timeout=5000) as blocker:
