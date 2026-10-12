@@ -341,3 +341,23 @@ def test_a_directory_failing_mid_listing_does_not_kill_the_scan(tmp_path, monkey
     plan = scanner.scan(src, tmp_path / "dst")
     assert plan.totals.files == 1
     assert plan.totals.dirs == 0
+
+
+def test_raw_target_has_no_long_path_prefix(tmp_path):
+    """断链的 raw_target 不能带 \\\\?\\ 前缀。
+
+    os.readlink 在 Windows 上把 junction 的 NT 前缀 \\\\??\\ 归一化成 \\\\?\\；
+    原样落库会让报告/CSV 的「raw → new」详情暴露丑前缀（new_target 已剥、raw 没剥）。
+    scanner 入库时应一并剥掉，与 new_target 保持一致。
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "real").mkdir()
+    (src / "real" / "a.txt").write_text("a", encoding="utf-8")
+    reparse.create_junction(src / "gone", tmp_path / "nonexistent")
+    plan = scanner.scan(src, tmp_path / "dst")
+    gone = next(l for l in plan.links if l.rel == "gone")
+    assert gone.is_dangling
+    assert not gone.raw_target.startswith("\\\\?\\")
+    assert not gone.raw_target.startswith("\\??\\")
+    assert not gone.new_target.startswith("\\\\?\\")

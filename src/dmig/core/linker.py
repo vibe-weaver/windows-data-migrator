@@ -142,6 +142,13 @@ def _group_by_prefix(targets: list[str],
         else:
             if len(items) == 1:
                 prefix = os.path.dirname(items[0])
+                # 单个目标取父目录，是为了让用户按「这片区域」整体重写、保留结构；
+                # 但目标若直接挂在盘根下，父目录会退化成 `C:\` —— 那个键在归属表里
+                # 看不出指哪个目录，当映射键又等于匹配整个 C 盘。这种退化情形下，
+                # 目标自己才是合适的「链接目标目录」。
+                # （多目标分支早就有同样的兜底，这里原来漏了。）
+                if prefix.rstrip("\\/") in (drive, ""):
+                    prefix = items[0]
             groups.append(TargetGroup(prefix=prefix or root, count=len(items),
                                       mapped_to=mapped_to(prefix or root)))
     return groups

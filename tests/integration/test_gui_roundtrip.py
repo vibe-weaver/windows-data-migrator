@@ -21,7 +21,11 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows")
 
 
 class _Dialog:
-    """QMessageBox 替身：真实弹窗是模态的，在 qtbot 里会一直转到超时。"""
+    """QMessageBox 替身：真实弹窗是模态的，在 qtbot 里会一直转到超时。
+
+    答复返回 `int`——真实 Qt 返回的就是普通 int 而不是枚举成员，
+    替身必须一致，否则 `is` 类判断在替身上成立、在真货上失效。
+    """
 
     StandardButton = QMessageBox.StandardButton
 
@@ -30,11 +34,11 @@ class _Dialog:
 
     def warning(self, parent, title, text, *buttons, **kwargs):
         self.texts.append(text)
-        return self.StandardButton.Ok
+        return int(self.StandardButton.Ok)
 
     def information(self, parent, title, text, *buttons, **kwargs):
         self.texts.append(text)
-        return self.StandardButton.Ok
+        return int(self.StandardButton.Ok)
 
 
 def _factory(tmp_path):

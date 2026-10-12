@@ -315,7 +315,12 @@ def main(argv: list[str] | None = None) -> int:
         migrator = Migrator(sess.source, sess.target)
         # 不接管会话，rollback() 里那句 phase="rolled_back" 就写不回文件
         migrator.adopt_session(sess)
-        return 0 if migrator.rollback() else 1
+        if migrator.rollback():
+            return 0
+        # 拒绝/失败的原因必须打印出来。回滚会被拒的最常见情形是备份已被删除，
+        # 此时只说「退出码 1」用户完全不知道发生了什么、也不知道原路径还安不安全。
+        print(f"回滚未执行：{migrator.cleanup_error or '未知原因'}", file=sys.stderr)
+        return 1
 
     if args.command == "discard":
         sess = Session.load(Path(args.session))

@@ -8,7 +8,8 @@ from pathlib import Path
 
 from . import linker
 from .fsutil import (has_alternate_streams, is_excluded, is_hardlinked, is_link_kind,
-                     is_sparse, long_path, rel_to, reparse_kind, volume_free_bytes)
+                     is_sparse, long_path, rel_to, reparse_kind, strip_long_prefix,
+                     volume_free_bytes)
 from .models import (EntryKind, LinkPlan, LinkTargetClass, MigrationPlan,
                      PlanTotals, UnknownReparse)
 
@@ -82,7 +83,10 @@ def scan(source, target, mappings: dict[str, str] | None = None,
 
                 if is_link_kind(kind):
                     try:
-                        raw = os.readlink(entry.path)
+                        # readlink 在 Windows 上会把 junction 的 NT 前缀 \\??\ 归一化成
+                        # \\?\；raw_target 原样落库会让报告/CSV 暴露这个前缀，这里先剥掉，
+                        # 与 new_target 保持一致。resolve_target 内部也会剥，传剥过的值无副作用。
+                        raw = strip_long_prefix(os.readlink(entry.path))
                     except OSError:
                         continue
                     resolved = linker.resolve_target(

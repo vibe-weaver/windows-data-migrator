@@ -51,3 +51,51 @@ def test_failures_with_nothing_to_report_writes_nothing(tmp_path):
     path = tmp_path / "run.log"
     RunLog(path).failures("复制失败", [])
     assert not path.exists()
+
+
+# --- 每一行同时喂给界面 -----------------------------------------------
+#
+# 界面上的「迁移日志」面板原来只写三个事件（校验开始/复制失败/取消），
+# 一次干净成功的迁移在界面上只剩一行校验提示，而磁盘日志里有十条。
+# 两条流各自演化必然继续漂移，所以让界面直接显示这份日志本身。
+
+def test_write_feeds_the_sink_with_the_same_line(tmp_path):
+    path = tmp_path / "run.log"
+    lines: list[str] = []
+    log = RunLog(path, on_line=lines.append)
+
+    log.write("开始一趟")
+    log.write("结果：ok=True")
+
+    # 界面上要看到和文件里一模一样的内容（含时间戳前缀）
+    assert lines == path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith("[20") and "开始一趟" in lines[0]
+
+
+def test_failures_also_reach_the_sink(tmp_path):
+    """失败清单是排查的主角，不能不进界面。"""
+    lines: list[str] = []
+    log = RunLog(tmp_path / "run.log", on_line=lines.append)
+    log.failures("复制失败", ["a.txt（拒绝访问）"])
+    assert any("复制失败：1 项" in line for line in lines)
+    assert any("a.txt（拒绝访问）" in line for line in lines)
+
+
+def test_broken_sink_never_breaks_logging(tmp_path):
+    """界面侧出问题绝不能影响迁移，也不能让日志少写一行。"""
+    path = tmp_path / "run.log"
+
+    def boom(_line):
+        raise RuntimeError("界面炸了")
+
+    log = RunLog(path, on_line=boom)
+    log.write("这行必须落盘")
+
+    assert "这行必须落盘" in path.read_text(encoding="utf-8")
+
+
+def test_sink_is_optional(tmp_path):
+    path = tmp_path / "run.log"
+    RunLog(path).write("没有界面也要能写")
+    assert "没有界面也要能写" in path.read_text(encoding="utf-8")

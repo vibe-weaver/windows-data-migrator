@@ -14,6 +14,41 @@ def test_is_cli_invocation_for_subcommands():
     assert entry.is_cli_invocation(["app.py", "rollback", "s.json"]) is True
 
 
+def test_discard_is_a_cli_subcommand():
+    """discard 有完整实现，README 与 cli 自己的报错文案都在教用户敲它。
+
+    入口的 CLI_COMMANDS 漏了它时，请求会被当成「没带子命令」转去开图形界面：
+    迁移中途失败的用户照着自己工具给的建议操作，得到的是一个窗口。
+    """
+    assert entry.is_cli_invocation(["app.py", "discard", "s.json", "--yes"]) is True
+
+
+def test_unknown_command_detects_typos():
+    """拼错的子命令要被认出来，不能当成「无子命令」去开图形界面。"""
+    assert entry.unknown_command(["app.py", "migrat", "--yes"]) == "migrat"
+    assert entry.unknown_command(["app.py", "scan", "--source", "x"]) is None
+    assert entry.unknown_command(["app.py"]) is None
+    assert entry.unknown_command(["app.py", "--elevated", "--session", "abc"]) is None
+
+
+def test_unknown_command_ignores_session_value():
+    """--session 的值长得像子命令，不能被当成拼错。"""
+    assert entry.unknown_command(["app.py", "--session", "migrate"]) is None
+
+
+def test_main_reports_unknown_subcommand_instead_of_opening_gui(monkeypatch, capsys):
+    import dmig.ui.main_window as window_mod
+
+    def _boom(argv):
+        raise AssertionError("未知子命令不该去开图形界面")
+
+    monkeypatch.setattr(window_mod, "run_gui", _boom)
+    assert entry.main(["app.py", "migrat", "--yes"]) != 0
+    out = capsys.readouterr().out
+    assert "migrat" in out
+    assert "scan" in out, "应当列出可用子命令"
+
+
 def test_is_cli_invocation_for_gui():
     assert entry.is_cli_invocation(["app.py"]) is False
     assert entry.is_cli_invocation(["app.py", "--elevated",

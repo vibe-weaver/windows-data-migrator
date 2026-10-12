@@ -3,10 +3,33 @@ from __future__ import annotations
 
 import sys
 
-CLI_COMMANDS = ("scan", "migrate", "resume", "rollback")
+CLI_COMMANDS = ("scan", "migrate", "resume", "rollback", "discard")
 CLI_HELP_FLAGS = ("-h", "--help")
 ELEVATED_FLAG = "--elevated"
 SESSION_FLAG = "--session"
+
+
+def unknown_command(argv: list[str]) -> str | None:
+    """找出「看起来像子命令、但不在 CLI_COMMANDS 里」的第一个位置参数。
+
+    用来把「没带子命令」（→ 开图形界面）与「带了不认识的词」（→ 报错）区分开。
+    `app.py migrat ...` 这种拼错，原来会被当成没带子命令，于是一声不吭弹出一个
+    图形窗口；在脚本或 CI 里表现为进程挂住不返回。
+
+    `--session` 的值（会话 id）要跳过——它长得就像个子命令。
+    """
+    tokens = list(argv)[1:]
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == SESSION_FLAG:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return None if token in CLI_COMMANDS else token
+    return None
 
 
 def is_cli_invocation(argv: list[str]) -> bool:
@@ -78,5 +101,13 @@ def main(argv: list[str] | None = None) -> int:
         force_utf8_stdio()
         from .cli import main as cli_main
         return cli_main(argv[1:])
+    unknown = unknown_command(argv)
+    if unknown is not None:
+        # 拼错子命令时给出纠错，而不是弹一个窗口让人莫名其妙
+        force_utf8_stdio()
+        print(f"未知子命令：{unknown}")
+        print(f"可用子命令：{'、'.join(CLI_COMMANDS)}")
+        print("不带子命令直接运行会打开图形界面，用法见 -h")
+        return 2
     from .ui.main_window import run_gui
     return run_gui(argv)

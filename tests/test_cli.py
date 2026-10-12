@@ -253,11 +253,31 @@ def test_rollback_restores_the_source_with_yes(tmp_path):
     assert not list(tmp_path.glob("src.bak_*"))
 
 
+def test_rollback_says_why_when_it_refuses(tmp_path, capsys):
+    """回滚被拒时必须说明原因。
+
+    最常见的拒绝情形是备份已被删除（迁移成功后命令行会自动删掉备份），
+    此时源路径上那条链接是唯一入口。原来 CLI 只写 `return 0 if rollback() else 1`，
+    用户得到一个退出码 1，既不知道发生了什么，也不知道原路径还安不安全。
+    """
+    src = _tree(tmp_path)
+    m = Migrator(src, tmp_path / "dst", session_root=tmp_path / "sessions")
+    out = m.execute()
+    assert out.ok, f"{out.phase} {out.message}"
+    m.cleanup_backup()                     # 模拟迁移成功后的自动清理
+
+    rc = cli.main(["rollback", str(m.session.path), "--yes"])
+
+    assert rc == 1
+    assert "备份" in capsys.readouterr().err, "必须说明拒绝原因"
+    assert reparse_kind(os.lstat(str(src))) is not None, "源路径必须完好"
+    assert (src / "two.bin").read_bytes() == b"2" * 500
+
+
 def test_migrate_requires_yes_without_tty(tmp_path):
     src = _tree(tmp_path)
     rc = cli.main(["migrate", "--source", str(src), "--target", str(tmp_path / "dst")])
     assert rc == 2
-
 
 def test_migrate_handles_eof_at_confirmation_prompt(tmp_path, monkeypatch, capsys):
     r"""交互确认时 stdin 到达 EOF，必须干净退出而不是抛 Traceback。

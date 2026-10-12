@@ -101,6 +101,29 @@ def test_group_targets_splits_by_drive():
     assert all(g.count == 1 for g in groups)
 
 
+def test_single_target_under_drive_root_keeps_its_own_path():
+    """单个目标、且它就挂在盘根下时，前缀不能退化成盘根。
+
+    真实案例：源树里只有一条链接指向 `C:\\wwwwwww2`（在 C 盘根目录下）。
+    取父目录得到 `C:\\` —— 归属表里显示一个「C:\\」，用户根本看不出它指哪个
+    目录；而拿 `C:\\` 当映射键等于匹配整个 C 盘下的所有目标。
+    这种情况目标自己才是合适的「链接目标目录」。
+
+    多目标分支早就防了这一手（前缀退化为盘根时改用各自父目录），单目标分支漏了。
+    """
+    groups = linker.group_targets([r"C:\wwwwwww2"])
+    assert len(groups) == 1
+    assert groups[0].prefix == r"C:\wwwwwww2"
+    assert groups[0].count == 1
+
+
+def test_single_target_under_drive_root_can_still_be_mapped():
+    """改成目标自己当前缀之后，填写「重写为」依然要生效。"""
+    groups = linker.group_targets([r"C:\wwwwwww2"],
+                                  {r"C:\wwwwwww2": r"E:\npm\wwwwwww2"})
+    assert groups[0].mapped_to == r"E:\npm\wwwwwww2"
+
+
 def test_group_targets_falls_back_to_parent_when_lcp_is_drive_root():
     """同盘但只在盘根处公共时，退化为按各自父目录分组。"""
     groups = linker.group_targets([r"C:\one\a", r"C:\two\b"])
