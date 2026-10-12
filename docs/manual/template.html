@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Windows数据迁移助手 · 使用说明书</title>
+<style>
+  :root { --ink:#1b1b1f; --muted:#5c5c66; --line:#e3e5ea; --accent:#17309a;
+          --warn:#8a5a00; --danger:#b3261e; --bg:#f6f7f9; --code:#f0f1f4; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.75 "Microsoft YaHei","Segoe UI",system-ui,sans-serif; }
+  .page { max-width:920px; margin:0 auto; padding:48px 40px 96px; background:#fff;
+          box-shadow:0 1px 24px rgba(0,0,0,.06); }
+  h1 { font-size:30px; margin:0 0 6px; letter-spacing:.5px; }
+  .sub { color:var(--muted); margin:0 0 4px; }
+  .meta { color:var(--muted); font-size:13px; border-bottom:2px solid var(--line);
+          padding-bottom:20px; margin-bottom:32px; }
+  h2 { font-size:21px; margin:44px 0 14px; padding-top:14px;
+       border-top:2px solid var(--line); }
+  h3 { font-size:17px; margin:26px 0 10px; color:#26262c; }
+  h4 { font-size:15px; margin:18px 0 8px; color:#33333a; }
+  p { margin:10px 0; }
+  ul, ol { margin:10px 0 10px 4px; padding-left:22px; }
+  li { margin:5px 0; }
+  code { background:var(--code); border-radius:4px; padding:1px 6px;
+         font-family:Consolas,"Cascadia Mono",monospace; font-size:13.5px; }
+  pre { background:var(--code); border-radius:8px; padding:14px 16px; overflow-x:auto;
+        font-family:Consolas,"Cascadia Mono",monospace; font-size:13.5px; line-height:1.6; }
+  table { border-collapse:collapse; width:100%; margin:14px 0; font-size:14px; }
+  th, td { border:1px solid var(--line); padding:9px 12px; text-align:left;
+           vertical-align:top; }
+  th { background:#f2f4f8; font-weight:600; }
+  .note, .warn, .danger { border-left:4px solid; border-radius:0 8px 8px 0;
+                          padding:12px 16px; margin:16px 0; }
+  .note { border-color:#2f6fe4; background:#f2f6ff; }
+  .warn { border-color:#c98a00; background:#fff9ec; }
+  .danger { border-color:var(--danger); background:#fdf1f0; }
+  .tag { display:inline-block; border-radius:5px; padding:1px 8px; font-size:12.5px;
+         font-weight:600; vertical-align:1px; }
+  .tag-danger { background:#fdecea; color:var(--danger); }
+  .tag-warn { background:#fff4dd; color:var(--warn); }
+  .tag-ok { background:#e8f5e9; color:#1b5e20; }
+  figure { margin:20px 0; }
+  figure img { width:100%; border:1px solid var(--line); border-radius:8px;
+               display:block; }
+  figcaption { color:var(--muted); font-size:13px; margin-top:8px; text-align:center; }
+  .toc { background:var(--bg); border-radius:10px; padding:18px 24px; }
+  .toc ol { margin:6px 0; }
+  .toc a { color:var(--accent); text-decoration:none; }
+  .toc a:hover { text-decoration:underline; }
+  hr { border:0; border-top:1px solid var(--line); margin:36px 0; }
+  .kbd { border:1px solid #c8ccd4; border-bottom-width:2px; border-radius:5px;
+         padding:1px 7px; font-size:13px; background:#fafbfc; }
+</style>
+</head>
+<body>
+<div class="page">
+
+<h1>Windows数据迁移助手</h1>
+<p class="sub">使用说明书 · 数据目录迁移</p>
+<p class="meta">版本 1.0.0 &nbsp;·&nbsp; 适用 Windows 10 / 11（64 位）&nbsp;·&nbsp;
+无需安装，解压即用</p>
+
+<div class="toc">
+<strong>目录</strong>
+<ol>
+  <li><a href="#what">这个工具做什么</a></li>
+  <li><a href="#run">运行与启动</a></li>
+  <li><a href="#ui">界面总览</a></li>
+  <li><a href="#step1">第一步：选择目录</a></li>
+  <li><a href="#holders">找出占用进程（子页面）</a></li>
+  <li><a href="#step2">第二步：确认计划</a></li>
+  <li><a href="#step3">第三步：执行迁移</a></li>
+  <li><a href="#step4">第四步：完成（报告页）</a></li>
+  <li><a href="#cli">命令行版</a></li>
+  <li><a href="#safety">数据安全须知</a></li>
+  <li><a href="#limit">已知限制</a></li>
+  <li><a href="#faq">常见问题</a></li>
+</ol>
+</div>
+
+<h2 id="what">1. 这个工具做什么</h2>
+
+<p>把一个<strong>数据目录整棵树搬到另一个盘</strong>，并在原路径上留下一个<strong>链接</strong>。
+迁移之后，原来的路径依然存在、程序照常按原路径访问，但实际数据已经在新盘上。</p>
+
+<p>典型用途：</p>
+<ul>
+  <li>C 盘空间不足，把某个软件的数据目录挪到 D 盘、E 盘</li>
+  <li>换硬盘：把整块盘上的数据目录搬到新盘</li>
+  <li>把巨大的缓存/素材/模型目录挪到容量盘，同时不想改任何软件的配置</li>
+</ul>
+
+<div class="note">
+<strong>和「剪切粘贴」的区别</strong>：剪切粘贴之后原路径就没了，任何按原路径找数据的程序都会报错。
+这个工具在最后一步会<strong>把原路径做成链接</strong>，所以两边都能继续用。
+</div>
+
+<p>迁移分四步，工具在每一步都尽量先验证、再动手：</p>
+<pre>1) 复制     把整棵树复制到目标盘（不动源）
+2) 校验     逐个文件比对，确认目标端完整
+3) 改名     把源目录改名成「备份」（这一步会失败——如果有程序占着它）
+4) 建链接   在原路径上建一个指向目标的链接</pre>
+
+<div class="danger">
+<strong>第 3 步是最容易失败的地方。</strong>只要有<strong>任何</strong>程序打开了源目录里的<strong>任何</strong>文件
+（哪怕只是资源管理器开着那个文件夹），改名就会失败——而此时复制和校验都已经跑完，
+用户已经等了几个小时。所以工具要求在开始之前先做一次<strong>检验</strong>（见 4.4）。
+</div>
+
+<h2 id="run">2. 运行与启动</h2>
+
+<p>解压压缩包，双击里面的 <code>Windows数据迁移助手.exe</code>。不需要安装，也不需要管理员权限。</p>
+
+<table>
+  <tr><th>什么时候需要管理员</th><th>说明</th></tr>
+  <tr>
+    <td>源树里有<strong>文件符号链接</strong></td>
+    <td>Windows 默认只允许管理员创建文件符号链接。目录链接（junction）不需要。
+        计划页会提示，并可点「以管理员身份重试」。</td>
+  </tr>
+  <tr>
+    <td>有<strong>无权限访问</strong>的目录</td>
+    <td>计划页会列出它们。可选择跳过，或提权后「接管这些目录的权限」（会记录原始
+        ACL，回滚时还原）。</td>
+  </tr>
+</table>
+
+<h2 id="ui">3. 界面总览</h2>
+
+<p>顶部是品牌栏与步骤条，底部是状态行（显示当前正在做什么、以及最近一次操作的结果）。</p>
+
+<p>四个步骤：<strong>选择目录 → 确认计划 → 执行迁移 → 完成</strong>。</p>
+
+<figure>
+  {{SHOT:select_empty}}
+  <figcaption>第一步的初始状态</figcaption>
+</figure>
+
+<h2 id="step1">4. 第一步：选择目录</h2>
+
+<h3>4.1 源目录</h3>
+<p>要搬走的那个目录。可以点「浏览…」选择，也可以<strong>直接把文件夹拖进输入框</strong>。</p>
+<p>源目录可以就是某个盘符根吗？不可以——工具会拒绝，因为没法给盘根建链接。</p>
+
+<h3>4.2 目标目录</h3>
+<p>数据要搬到的地方。它会成为源目录的「新家」。</p>
+<ul>
+  <li>目标目录<strong>不存在</strong>时会新建；</li>
+  <li>目标目录<strong>已存在且非空</strong>时会按「合并/续传」处理——这一点在计划页会有明确说明；</li>
+  <li>源目录不能套在目标目录里，反之亦然（工具会拦下来）。</li>
+</ul>
+
+<h3>4.3 剩余空间</h3>
+<p>两个路径右侧各显示所在卷的剩余空间，用于对照计划页算出的「所需空间」。这张盘剩余不足时，
+计划页会给出提示。</p>
+
+<h3 id="check">4.4 开始检验 <span class="tag tag-danger">必须做</span></h3>
+
+<p>右上角的「<strong>开始检验</strong>」按钮做两件事：</p>
+<ol>
+  <li><strong>前置检查</strong>——源/目标是否存在、是不是链接、有没有互为子目录、同盘、空间是否够；</li>
+  <li><strong>试探改名</strong>——把源目录改名再立刻改回来（几毫秒），用来回答那个最关键的问题：
+      <em>现在有没有程序占着它</em>。</li>
+</ol>
+
+<div class="warn">
+<strong>为什么必须检验</strong>：改名失败是唯一一个「等到最后一步才炸」的错误。复制校验全过、
+用户等了几个小时，才卡在改名上。试探改名把这个风险提前到几毫秒内暴露。
+<br><br>
+<strong>「开始扫描」在检验通过之前是灰的</strong>——没有检验就没有结论，就不放行。
+</div>
+
+<p><strong>检验的副作用</strong>（按钮的悬停提示里也写了）：源路径会消失几毫秒，
+正开着这个目录的程序可能报「文件夹已删除」。这是正常的，改回来了。</p>
+
+<p>检验结果分四种状态：</p>
+
+<table>
+  <tr><th>状态</th><th>显示</th><th>能否继续</th></tr>
+  <tr><td>尚未选择目录</td><td>中性指引</td><td>不能</td></tr>
+  <tr><td>选好了但<strong>还没检验</strong></td><td>中性指引，明确提示去点「开始检验」</td><td>不能</td></tr>
+  <tr><td>检验通过</td><td>绿色说明；可能同时有<strong>黄色警告</strong></td><td>能</td></tr>
+  <tr><td>有问题</td><td>逐条列出</td><td>看颜色</td></tr>
+</table>
+
+<h4>红色与黄色的区别</h4>
+<ul>
+  <li><span class="tag tag-danger">红色 · 错误</span> 会<strong>禁止进入下一步</strong>。
+      例如：源目录不存在、源目录是链接、源目录无法改名、空间不足。</li>
+  <li><span class="tag tag-warn">黄色 · 警告</span> <strong>不拦</strong>，只是让你知情。
+      例如：源和目标在同一个卷（迁移不会释放空间，且备份与原件同盘）。</li>
+</ul>
+
+<figure>
+  {{SHOT:select_issues}}
+  <figcaption>检验发现问题：红色拦下一步，黄色只提示</figcaption>
+</figure>
+
+<h3>4.5 找出占用进程 <span class="tag">按需出现</span></h3>
+
+<p>只有<strong>检验因「源目录无法改名」失败</strong>时，卡片上才会多出一个
+「<strong>找出占用进程 →</strong>」按钮。别的错误（源不存在、空间不足）不会出现它——
+那些问题在这一页解决不了。</p>
+
+<p>点它直接跳到子页面，详细说明见第 5 节。</p>
+
+<h2 id="holders">5. 找出占用进程（子页面）</h2>
+
+<p>这不是向导的第 5 步，而是第一步的子流程：步骤条仍然停在「选择目录」，
+办完点左下角的「<strong>← 返回选择目录</strong>」，工具会自动重跑一次检验。</p>
+
+<h3>5.1 扫描的两个阶段</h3>
+<ol>
+  <li><strong>缩小范围</strong>——逐个试探源目录的<strong>子目录</strong>，找出哪几棵子树被占着；
+      这一步很快。顺带说明：试探只针对子目录，<strong>平铺的普通文件不试探</strong>——
+      试一个文件约 0.67 毫秒，而直接让系统扫它只要 0.13 毫秒，试它反而更慢。</li>
+  <li><strong>扫描占用</strong>——只对嫌疑子树问系统「谁占着这些文件」。这一步的进度条按文件数走。</li>
+</ol>
+
+<div class="note">
+如果源目录顶层条目<strong>特别多</strong>（超过 2000 个，例如整个目录平铺了一堆文件），
+工具会跳过第一阶段直接扫整棵树，并在说明行里告诉你原因——逐个试探那时比直接扫还慢。
+</div>
+
+<h3>5.2 占用者表格</h3>
+
+<table>
+  <tr><th>列</th><th>含义</th></tr>
+  <tr><td>进程</td><td>程序名</td></tr>
+  <tr><td>PID</td><td>进程号</td></tr>
+  <tr><td>可执行文件</td><td><strong>完整路径</strong>——用来确认「这到底是哪个程序」，光看名字可能认不出</td></tr>
+  <tr><td>状态</td><td><code>可由本工具关闭</code> 或 <code>不关闭</code></td></tr>
+</table>
+
+<figure>
+  {{SHOT:holders}}
+  <figcaption>找到占用者；受保护的程序照列出来，但写明为什么不关</figcaption>
+</figure>
+
+<h3>5.3 关闭这些程序</h3>
+<p>按钮上会写明<strong>要关几个</strong>（例如「关闭这 1 个程序」）。点下去走的是系统官方的关闭通道
+（和安装程序让你「关闭以下程序以继续」是同一个机制）：程序会走正常退出流程，
+该提示保存的还会提示保存。</p>
+
+<div class="note">
+<strong>为什么没有「只关其中几个」的勾选</strong>：底层接口是整批的，做不到逐个选择。
+想少关几个，请先自己手动关掉，再点「重新扫描」。
+</div>
+
+<h3>5.4 工具<strong>不会</strong>关闭哪些程序</h3>
+<p>下面这些进程即使占着文件，工具也不动手，并且会<strong>说明理由</strong>，请你手动处理：</p>
+
+<table>
+  <tr><th>类别</th><th>例子</th><th>理由</th></tr>
+  <tr><td>系统关键进程</td><td><code>System</code>、<code>smss</code>、<code>csrss</code>、
+      <code>wininit</code>、<code>winlogon</code>、<code>services</code>、<code>lsass</code>、
+      <code>svchost</code></td><td>关掉会蓝屏、重启、注销，或连带一批系统服务</td></tr>
+  <tr><td>桌面外壳</td><td><code>explorer.exe</code>、<code>dwm.exe</code></td>
+      <td>关掉会让桌面、任务栏和所有已打开的文件夹消失；整个屏幕显示异常</td></tr>
+  <tr><td>安全软件</td><td><code>MsMpEng.exe</code>、<code>NisSrv.exe</code>、
+      <code>SecurityHealthService.exe</code></td><td>关掉会让电脑失去实时防护</td></tr>
+  <tr><td>工具自己</td><td>本程序及其父进程链</td><td>关掉会把工具自己带走</td></tr>
+  <tr><td>身份不明</td><td>取不到可执行文件路径的进程</td><td>证明不了它是什么，就不能假设它安全</td></tr>
+</table>
+
+<div class="warn">
+<strong>只要批次里混进一个受保护进程，工具就一个都不关。</strong>
+底层关闭接口是整批生效的——放行就等于把 <code>explorer</code> 之类一起关掉。
+所以宁可这一次不动手，把「为什么不动」原样告诉你。
+</div>
+
+<h3>5.5 强制结束</h3>
+<p>只有在<strong>关闭请求发出去之后没成功</strong>时才会出现这个按钮。它会单独弹窗确认一次，
+并明确警告：<strong>程序里未保存的内容会直接丢失</strong>，正在写盘的数据可能损坏。</p>
+
+<p>被 5.4 的名单挡下时<strong>不会</strong>给这个按钮——强制走的是同一条路，一样会被拦，
+给了就是个按不动的死按钮。</p>
+
+<h3>5.6 重新扫描</h3>
+<p>手动关掉程序、或关了一部分之后，点它重新查一遍。扫描结束前后，「重新扫描」按钮始终可用。</p>
+
+<h3>5.7 「改不了名，但查不出占用者」是怎么回事</h3>
+<p>有一种占用<strong>查不到具体进程</strong>：程序把<strong>源目录本身</strong>当作工作目录。
+典型情况是：</p>
+<ul>
+  <li>资源管理器正开着这个目录（或它的父目录）</li>
+  <li>有个终端 <code>cd</code> 在里面</li>
+</ul>
+<p>这类占用挡得住改名，但拿不到进程号。工具会如实说明这一点，你手动关掉那些窗口再重新扫描即可。</p>
+
+<div class="note">
+<strong>关完之后</strong>：工具会<strong>重新做一次改名试探</strong>——能改名才算解决。
+只有这时才会显示绿色的「占用已解除」。如果返回码说失败、但实际已经能改名，
+也会如实报「已解除」（系统那个接口会返回「部分成功」，容易被误读成失败）。
+</div>
+
+<h2 id="step2">6. 第二步：确认计划</h2>
+
+<p>扫描完成后进入这一页。它<strong>不改动任何东西</strong>，只把将要发生的事摊开给你看。</p>
+
+<h3>6.1 迁移计划</h3>
+<p>页面最上方是一排关键指标：</p>
+<table>
+  <tr><th>指标</th><th>含义</th></tr>
+  <tr><td>真实数据量</td><td>要搬走的总字节</td></tr>
+  <tr><td>文件数 / 目录数</td><td>这棵树里有多少个文件与目录</td></tr>
+  <tr><td>链接数</td><td>树里有多少个链接（它们的<strong>外部数据不会被复制</strong>，只重建链接）</td></tr>
+  <tr><td>需提权目录</td><td>有多少个目录当前权限访问不了</td></tr>
+  <tr><td>被占用</td><td><strong>迁移前不做全树预扫</strong>（那要对每个文件问一次系统）。真正的占用检测在
+      执行时做，失败会列进报告的未完成清单</td></tr>
+  <tr><td>预计耗时</td><td>按本次扫描的实测速度估算</td></tr>
+</table>
+
+<h3>6.2 计划摘要</h3>
+<p>源目录、目标目录、目标盘剩余空间。若目标盘不够会明确提示；若目标目录已存在且非空，
+这里也会说明将按「合并 / 续传」处理。</p>
+
+<h3>6.3 链接目标归位表</h3>
+<p>源树里的链接（junction / 符号链接）不会把<strong>外部仓库的数据</strong>复制过来——
+只重建链接本身。但如果链接指向的仓库也在被搬的范围内，就需要改写链接的指向。</p>
+<p class="meta" style="border:0">多数情况这张表留空就行：只有那些目录<strong>原来的位置以后不再存在</strong>时才需要填。</p>
+
+<table>
+  <tr><th>列</th><th>含义</th></tr>
+  <tr><td>链接目标目录</td><td>链接现在指向哪里</td></tr>
+  <tr><td>链接数</td><td>有多少个链接指向这里</td></tr>
+  <tr><td><strong>重写为</strong></td><td><strong>可编辑</strong>。留空表示不重写，保持原指向</td></tr>
+  <tr><td>迁移后指向</td><td>按你填的内容，实时算出迁移后这个链接会指向哪里</td></tr>
+</table>
+
+<figure>
+  {{SHOT:plan}}
+  <figcaption>计划页：摘要、链接映射表（「重写为」可直接编辑）、三个勾选项</figcaption>
+</figure>
+
+<h3>6.4 怎么用「重写为」</h3>
+<p>假设源树里有 <code>node_modules</code> 指向 <code>E:\npm-cache</code>，而
+<code>E:\npm-cache</code> 这次也要一起搬。目标端重建链接时如果还写
+<code>E:\npm-cache</code>，那它指的就不再是你这份数据的副本了。</p>
+<p>在「重写为」里填目标端对应的新位置（例如 <code>F:\npm-cache</code>），
+「迁移后指向」这一列会立刻告诉你结果对不对。填错了随时改。</p>
+
+<h3>6.5 应用映射并重新扫描</h3>
+<p>改完映射后点它重新扫描一遍，让计划和摘要按新映射重算。这一趟通常很快。</p>
+
+<h3>6.6 无权限目录与提权</h3>
+<table>
+  <tr><th>按钮</th><th>什么时候可用</th><th>做什么</th></tr>
+  <tr><td>以管理员身份重试</td><td>重建文件符号链接需要特权时</td>
+      <td>以管理员身份重新启动本工具</td></tr>
+  <tr><td>接管这些目录的权限</td><td>确实有无权限目录，且已经是管理员</td>
+      <td>对这些目录执行接管属主与授权。<strong>会先把原始 ACL 记进会话，回滚时还原</strong></td></tr>
+</table>
+
+<h3>6.7 非链接类重解析点</h3>
+<p>这一类条目既不是链接，也不是普通文件或目录：<strong>云占位符</strong>（OneDrive 按需文件，
+本地只有一个指针、内容在云端）、<strong>AppExecLink</strong>（应用商店应用的执行别名）、
+<strong>Dedup</strong>（服务器去重）等。它们背后都有真实数据。</p>
+<p>默认按<strong>真实内容复制</strong>——能直读的读出来（云占位符会触发下载，
+可能很慢、很占流量），读不动的把重解析数据原样搬过去。</p>
+
+<table>
+  <tr><th>选项</th><th>默认</th><th>说明</th></tr>
+  <tr>
+    <td>跳过下列条目，不按真实内容复制</td>
+    <td>关</td>
+    <td>勾选后这些条目<strong>完全不复制，只留在备份里</strong>。
+        源目录删除后备份就是唯一副本，而备份通常也会跟着被删——
+        请先确认它们确实不再需要。</td>
+  </tr>
+</table>
+
+<h3>6.8 复制选项</h3>
+<table>
+  <tr><th>选项</th><th>默认</th><th>说明</th></tr>
+  <tr>
+    <td>启用 SHA256 全量校验<br><span class="meta" style="border:0;padding:0;margin:0">（较慢）</span></td>
+    <td>关</td>
+    <td>默认已比对大小与时间戳。开启后会逐个文件算哈希，能进一步发现
+        「大小和时间戳都相同、内容却已损坏」的文件。数据量大时明显变慢。</td>
+  </tr>
+  <tr>
+    <td>跳过无权限访问的目录</td>
+    <td>关</td>
+    <td>这些目录<strong>只保留在备份里</strong>，复制不到目标端。
+        不勾选时会因权限问题报错停下。</td>
+  </tr>
+</table>
+
+<div class="danger">
+上面两个「跳过」的共同点：<strong>被跳过的内容只存在于备份里</strong>。
+「删除备份」会让它们永久消失。报告页对此有明确警告。
+</div>
+
+<h3>6.9 三个按钮</h3>
+<table>
+  <tr><th>按钮</th><th>做什么</th></tr>
+  <tr><td>应用映射并重新扫描</td><td>按你填的映射重算计划。改动映射后必须点它</td></tr>
+  <tr><td>以管理员身份重试</td><td>重建文件符号链接需要特权时可用，以管理员身份重启本工具</td></tr>
+  <tr><td>接管这些目录的权限</td><td>接管无权限目录的属主。<strong>会先把原始 ACL 记进会话，回滚时还原</strong></td></tr>
+</table>
+
+<h2 id="step3">7. 第三步：执行迁移</h2>
+
+<figure>
+  {{SHOT:progress}}
+  <figcaption>执行中：进度、速度、预计剩余、失败清单</figcaption>
+</figure>
+
+<h3>7.1 进度区</h3>
+<p>显示整体进度、当前文件、速度、预计剩余时间、已复制文件数，以及实时日志。</p>
+
+<h3>7.2 暂停 / 取消</h3>
+<table>
+  <tr><th>按钮</th><th>行为</th></tr>
+  <tr><td>暂停 / 继续</td><td>当前文件复制完之后停下，可随时继续。已复制的内容保留</td></tr>
+  <tr><td>取消</td><td>点下后按钮变为「正在停止…」并禁用，走到下一个检查点就停。
+      <strong>已经复制的内容会保留</strong>，下次可接着来</td></tr>
+</table>
+
+<div class="note">
+<strong>取消不等于前功尽弃。</strong>工具会记录已完成与失败的每一个文件；
+重新启动后选中同一个会话，会<strong>从断点继续</strong>（已完成且未改动的文件会跳过）。
+</div>
+
+<h3>7.3 失败清单</h3>
+<p>列出没能复制的文件和原因（<code>相对路径 / 原因 / 占用进程</code>）。
+「原因」会写清楚是文件被占用、还是读写错误；被占用时还会列出占用它的进程。</p>
+
+<h3>7.4 打开日志文件</h3>
+<p>用资源管理器定位到日志文件。日志记录整趟迁移的每一步，出问题时它是最重要的排查依据。</p>
+<p>日志与会话文件都在：</p>
+<pre>%LOCALAPPDATA%\DataMigrationTool\sessions\
+    &lt;会话 ID&gt;.json     结构化数据（阶段、统计、链接清单）
+    &lt;会话 ID&gt;.done     已完成文件的清单（用于断点续传）
+    &lt;会话 ID&gt;.log      完整运行日志</pre>
+
+<h2 id="step4">8. 第四步：完成（报告页）</h2>
+
+<figure>
+  {{SHOT:report}}
+  <figcaption>迁移完成后的报告页</figcaption>
+</figure>
+
+<h3>8.1 统计</h3>
+<table>
+  <tr><th>项</th><th>含义</th></tr>
+  <tr><td>成功复制（个）</td><td>成功复制的文件数</td></tr>
+  <tr><td>成功复制（字节）</td><td>成功复制的总字节</td></tr>
+  <tr><td>跳过（已存在）</td><td>目标端已有、且大小与时间戳一致的文件（续传时常见）</td></tr>
+  <tr><td>复制失败</td><td>没能复制的文件数（<strong>非零会标红</strong>）</td></tr>
+  <tr><td>校验缺失</td><td>目标端缺少的文件数（<strong>非零会标红</strong>）</td></tr>
+  <tr><td>校验不一致</td><td>源与目标内容不一致的文件数（<strong>非零会标红</strong>）</td></tr>
+  <tr><td>断链（原样重建）</td><td>本来就指向不存在位置的链接——工具照样原样重建，列出来让你知道</td></tr>
+</table>
+
+<h3>8.2 未完成清单</h3>
+<p>把「没做完的事」汇总成一张表。四列分别是：<strong>类别</strong>（未复制 / 缺失 / 不一致 /
+断链 / 链接重写 / 目录时间戳 / 未保留属性 / 未完成步骤）、<strong>相对路径</strong>、
+<strong>原因</strong>、<strong>占用进程</strong>。这一页和导出的 CSV 内容一致。</p>
+<p>表是空的，说明这一趟没有遗留问题。</p>
+
+<h3>8.3 备份警告</h3>
+<p>只要备份还在，报告页顶部就有一条红色警告，写明备份在哪，并强调：</p>
+<pre>回滚必须依靠备份文件。删除备份后将无法再进行回滚——「一键回滚」会直接失败，
+源路径也就回不到迁移前的状态了。确认不再需要退回迁移前的状态，再用本页的「删除备份」。</pre>
+<p><strong>判据是「你是否确定不再需要退回迁移前的状态」，不是「是否已经手动验证过」。</strong>
+这条警告在备份被删除或回滚成功之后会自动消失。</p>
+
+<h3>8.4 导出 CSV</h3>
+<p>把当前这一页的内容导出成 CSV，用于存档、报修或转给别人看。
+在恢复态（见 8.8）导出的是<strong>恢复信息</strong>，不是迁移报告。</p>
+
+<h3>8.5 重新校验</h3>
+<p>再做一遍完整性比对。用途：迁移之后又往目标端写过东西，想确认没被破坏。
+<br>注意：<strong>回滚之后这个按钮会禁用</strong>——那一刻源是刚还原回来的原件、
+目标端是清空或半残的副本，两边早已不是同一次搬迁的两端，比出来的全是假的缺失。</p>
+
+<h3>8.6 删除目标</h3>
+<p>目标端只留下半成品、你确认不需要了时的清理出口。会弹窗确认，并说明源目录不受影响。</p>
+
+<h3>8.7 一键回滚</h3>
+<p>退回迁移前的状态：把备份改回原名、恢复真实目录。</p>
+
+<p>回滚前会弹窗确认，并带一个<strong>默认不勾选</strong>的选项：</p>
+<pre>同时删除目标端里同步过去的内容（迁移之后写进去的东西不会被删）</pre>
+
+<ul>
+  <li><strong>不勾</strong>：只还原源路径，目标端那份原样留着；</li>
+  <li><strong>勾上</strong>：把目标端里<strong>同步过去的内容</strong>清掉，但<strong>目录本身保留</strong>——
+      「迁移之后新写进目标端的东西」不会被动。</li>
+</ul>
+
+<div class="note">
+<strong>回滚必须有备份。</strong>如果备份已经被删除，回滚会被拒绝并说明原因。
+</div>
+
+<h3>8.8 删除备份 <span class="tag tag-danger">不可逆</span></h3>
+<p>删除源数据在备份里的最后一份副本。确认弹窗会明确写出：<strong>删掉之后就无法再回滚了</strong>。</p>
+
+<p>有一种情况是<strong>删不掉</strong>的：备份里含有「只存在于备份里」的内容
+（被跳过的条目、被排除的目录）。工具会说明原因，并再问一次
+「<strong>仍要强制删除吗</strong>」——请先确认那些内容确实不再需要。</p>
+
+<div class="warn">
+<strong>请勿在不确定的情况下删除备份。</strong>
+判据是「你是否确定不再需要退回迁移前的状态」，而不是「是否已经手动验证过」。
+回滚必须依靠备份文件；删除备份后将无法再进行回滚。
+</div>
+
+<h3>8.9 回滚之后：页面会变成「恢复态」</h3>
+<p>回滚成功后，报告页会从「迁移结果」切换成「<strong>恢复结果</strong>」，因为那件事已经被撤销了：</p>
+<ul>
+  <li>标题变成「<strong>恢复成功</strong>」，统计网格与未完成清单隐藏；</li>
+  <li>改为列出四项恢复信息：<strong>源目录</strong>（是否已恢复为真实目录）、
+      <strong>备份</strong>（是否已改回原名）、<strong>目标端</strong>（已清空／保留未清／未清理／本就不存在）、
+      <strong>权限</strong>（接管过的权限是否已还原）；</li>
+  <li>「导出 CSV」导出的是这份恢复信息；</li>
+  <li>「一键回滚」与「删除备份」禁用（备份已经不存在了），「删除目标」按需可用。</li>
+</ul>
+
+<figure>
+  {{SHOT:restored}}
+  <figcaption>回滚后的恢复态</figcaption>
+</figure>
+
+<h2 id="cli">9. 命令行版</h2>
+
+<p>如果压缩包里带了 <code>Windows数据迁移助手-cli.exe</code>，可以在脚本里调用它。
+五个子命令：</p>
+
+<table>
+  <tr><th>子命令</th><th>用途</th></tr>
+  <tr><td><code>scan</code></td><td>只预扫描，输出迁移计划</td></tr>
+  <tr><td><code>migrate</code></td><td>执行迁移</td></tr>
+  <tr><td><code>resume &lt;会话&gt;</code></td><td>从会话继续未完成的迁移</td></tr>
+  <tr><td><code>rollback &lt;会话&gt;</code></td><td>回滚一次迁移</td></tr>
+  <tr><td><code>discard &lt;会话&gt;</code></td><td>删除目标端的半成品（源目录不受影响）</td></tr>
+</table>
+
+<h3>9.1 全部参数</h3>
+<table>
+  <tr><th>参数</th><th>适用</th><th>说明</th></tr>
+  <tr><td><code>--source</code></td><td>scan / migrate</td><td>源目录（必填）</td></tr>
+  <tr><td><code>--target</code></td><td>scan / migrate</td><td>目标目录（必填）</td></tr>
+  <tr><td><code>--map 源=目标</code></td><td>scan / migrate</td><td>链接目标前缀映射，可重复</td></tr>
+  <tr><td><code>--exclude &lt;目录&gt;</code></td><td>scan / migrate</td>
+      <td>整棵跳过的目录，可重复。跳过的内容只保留在备份里</td></tr>
+  <tr><td><code>--no-ads-scan</code></td><td>scan / migrate</td>
+      <td>不探测附加数据流（ADS）。探测要对每个文件问一次文件系统，几十万文件下是可测的常数开销；
+          关掉后计划里不再报 ADS 条数</td></tr>
+  <tr><td><code>--skip-unknown-reparse</code></td><td>scan / migrate</td>
+      <td>跳过非链接类重解析点（默认按真实内容复制）</td></tr>
+  <tr><td><code>--take-ownership</code></td><td>migrate</td>
+      <td>以管理员身份运行时接管无权限目录的属主（先把原始 ACL 记进会话，回滚时还原）</td></tr>
+  <tr><td><code>--sha256</code></td><td>migrate</td><td>启用逐文件哈希校验</td></tr>
+  <tr><td><code>--keep-backup</code></td><td>migrate</td><td>结束后<strong>保留</strong>备份目录（默认删除）</td></tr>
+  <tr><td><code>--dry-run</code></td><td>migrate</td><td>只出计划，不改动任何东西</td></tr>
+  <tr><td><code>--yes</code></td><td>migrate / resume / rollback / discard</td>
+      <td>跳过交互确认</td></tr>
+  <tr><td><code>--session-root</code></td><td>migrate</td><td>会话与日志的存放目录</td></tr>
+</table>
+
+<div class="danger">
+<strong>命令行版默认在成功之后删除备份</strong>（<code>--keep-backup</code> 可保留）。
+删掉备份就再也无法回滚了——不确定时请加上 <code>--keep-backup</code>。
+</div>
+
+<h2 id="safety">10. 数据安全须知</h2>
+
+<h3>10.1 迁移的四步，以及每步失败会怎样</h3>
+<table>
+  <tr><th>阶段</th><th>做了什么</th><th>失败了会怎样</th></tr>
+  <tr><td>1 复制</td><td>把整棵树复制到目标端，源一动不动</td>
+      <td>源完好，目标端留半成品，可清理或重来</td></tr>
+  <tr><td>2 校验</td><td>逐个文件比对目标端是否完整</td>
+      <td>同上，报告页会列出缺失/不一致的文件</td></tr>
+  <tr><td>3 改名</td><td>源目录改名为 <code>&lt;源名&gt;.bak_&lt;时间戳&gt;</code></td>
+      <td><strong>源仍在原路径上</strong>，什么都没变。关掉占用它的程序后重试即可</td></tr>
+  <tr><td>4 建链接</td><td>在原路径建一个指向目标端的链接</td>
+      <td>源已经在备份名下，工具会停在这里并告诉你备份在哪</td></tr>
+</table>
+
+<h3>10.2 备份是什么、放在哪</h3>
+<p>备份就是<strong>改名之后的源目录</strong>，与源目录同级，命名形如：</p>
+<pre>C:\a\wwwwww            ← 源目录
+C:\a\wwwwww.bak_20261012143012   ← 备份（迁移成功后，原路径上是链接）</pre>
+<p>它是你退回迁移前状态的<strong>唯一依靠</strong>。</p>
+
+<h3>10.3 中断了怎么办</h3>
+<p>会话会持续写到 <code>%LOCALAPPDATA%\DataMigrationTool\sessions\</code>。
+界面重新进入时选中同一个会话即可继续；命令行用 <code>resume &lt;会话&gt;</code>。
+已完成且未被改动的文件会跳过。</p>
+
+<h3>10.4 什么情况下回滚还能做</h3>
+<ul>
+  <li>备份<strong>还在</strong>；</li>
+  <li>源路径当前<strong>是链接</strong>（也就是迁移确实完成了）；</li>
+</ul>
+<p>两条不满足时工具会拒绝回滚，并说明原因——它不会在没有退路的情况下动手。</p>
+
+<h2 id="limit">11. 已知限制</h2>
+
+<table>
+  <tr><th>限制</th><th>说明与影响</th></tr>
+  <tr>
+    <td><strong>目录句柄占用查不出进程</strong></td>
+    <td>有程序把源目录本身当工作目录（资源管理器开着它、终端 cd 在里面）时，
+        改名会被挡住，但系统接口拿不到那个进程。界面会如实说明并让你手动关。</td>
+  </tr>
+  <tr>
+    <td><strong>稀疏文件会变实占</strong></td>
+    <td>稀疏文件（例如动态 VHD）复制到目标端后会占用<strong>完整大小</strong>。
+        计划页的空间需求是按逻辑大小算的，与之一致，不会中途才告诉你空间不够。</td>
+  </tr>
+  <tr>
+    <td><strong>占用扫描在超大目录上耗时较长</strong></td>
+    <td>扫描成本约每文件 0.13 毫秒。几十万文件时需要等，进度条会显示进展。</td>
+  </tr>
+  <tr>
+    <td><strong>非链接类重解析点默认按真实内容复制</strong></td>
+    <td>某些特殊重解析点（非 junction/符号链接）默认按内容复制；
+        也可在计划页勾选跳过，跳过的只保留在备份里。</td>
+  </tr>
+  <tr>
+    <td><strong>同盘迁移不释放空间</strong></td>
+    <td>源与目标在同一个卷时，迁移不会释放空间，而且备份与原件同盘——
+        这张盘出问题两边一起丢。工具会用黄色警告提示这一点。</td>
+  </tr>
+</table>
+
+<h2 id="faq">12. 常见问题</h2>
+
+<h3>为什么非要我先点「开始检验」？</h3>
+<p>因为「源目录能不能改名」是唯一一个会等到最后才暴露的错误。检验里那一次几毫秒的
+试探改名，能在你等几个小时之前就把这个问题问出来。</p>
+
+<h3>迁移大概要多久？</h3>
+<p>主要取决于数据总量和磁盘速度。小文件多时（几万个）主要花在每文件的系统调用上；
+大文件多时受磁盘带宽限制。执行页会实时显示速度和预计剩余。</p>
+
+<h3>中途取消了，白干了吗？</h3>
+<p>没有。已完成的文件都记在会话里，重新选中同一个会话会从断点继续，
+已完成且未改动的文件直接跳过。</p>
+
+<h3>目标目录里已经有同名文件怎么办？</h3>
+<p>工具会按「合并/续传」处理：已完成且大小与时间戳一致的文件跳过，其余覆盖。
+目标端「不属于这次迁移」的内容不会被删——回滚时清目标端也会先检查这一点。</p>
+
+<h3>源目录里的快捷方式/链接会被复制过去吗？</h3>
+<p>不会复制它指向的<strong>数据</strong>——只在目标端重建<strong>链接本身</strong>。
+这是有意为之：链接指向的外部仓库不该被搬两遍。如果那个仓库也在搬迁范围内，
+用计划页的「重写为」把链接指向改成新位置。</p>
+
+<h3>提示无权限访问怎么办？</h3>
+<p>两种选择：勾选「跳过无权限访问的目录」（它们只保留在备份里），
+或者以管理员身份重试后点「接管这些目录的权限」——工具会先把原始 ACL 记进会话，
+回滚时还原。</p>
+
+<h3>工具关掉了别的程序，会不会弄丢我没保存的东西？</h3>
+<p>「关闭这些程序」走的是系统官方的关闭通道，程序会走正常退出流程，
+该提示保存的会先提示保存。<strong>只有「强制结束」才会直接丢未保存内容</strong>，
+而它需要单独确认。</p>
+
+<h3>我把备份删了，还能回滚吗？</h3>
+<p>不能。回滚必须依靠备份文件。删除备份时工具会明确写出这一点并要求确认。</p>
+
+<h3>为什么工具不肯关闭某个程序？</h3>
+<p>见 5.4 的名单。每一类都会写明理由。这些程序要么关掉会导致系统层面的事故，
+要么关掉会让工具自己消失，要么无法确认它到底是什么。请手动处理。</p>
+
+<hr>
+<p class="meta" style="border:0">
+本说明书对应 <strong>Windows数据迁移助手 1.0.0</strong>。
+界面文案以实际程序为准。
+</p>
+
+</div>
+</body>
+</html>
+
+
+

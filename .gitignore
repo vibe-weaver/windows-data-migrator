@@ -21,3 +21,9 @@ packaging/app.ico
 # 运行期数据
 logs/
 sessions/
+
+# 开发时的临时产物
+# 注意：.gitignore **不支持行内注释**——模式和注释必须各占一行，
+# 写成 `outputs/   # 说明` 会被当成一个模式名，什么也匹配不到。
+outputs/
+.shots/
