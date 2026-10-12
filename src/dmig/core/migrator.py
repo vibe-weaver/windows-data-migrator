@@ -1,25 +1,48 @@
 """迁移编排：把扫描、复制、校验、改名、建链接、清理/回滚串成状态机。"""
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
 import stat
 import time
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from . import guard, linker, locks, permission, reparse, scanner, verifier
 from .copier import run as copy_run
-from .fsutil import is_inside, is_link_kind, long_path, reparse_kind, strip_long_prefix
+from .fsutil import (is_inside, is_link_kind, long_path, rel_to, reparse_kind,
+                     strip_long_prefix)
 from .models import CopyResult, MigrationPlan, VerifyResult
 from .runlog import LOG_SUFFIX, RunLog
 from .session import Session
 
-# 改名要独占整棵树，而冲突（资源管理器开着子目录、终端 cwd 在里面、杀软在扫）
-# 往往是瞬时的，所以退避重试；仍失败才去查是谁占用。
+# 改名要独占整棵树，而冲突（资源管理器开着子目录、杀软在扫）往往是瞬时的，
+# 所以退避重试；仍失败才去查是谁占用。
+# （注：曾经写「终端 cwd 在里面」也算一种，实测 cwd 并不阻塞改名，已删。）
 RENAME_DELAYS: tuple[float, ...] = (0.5, 1.0, 2.0, 5.0)
 RENAME_LOCK_SAMPLE = 2000
+
+# 改名失败的常见 Windows 错误码 → 人话。
+# 直接用 str(exc) 会把 Python 的异常格式连同 `\\?\` 长路径前缀一起甩到界面上
+# （真实反馈：标题下面挂着 `[WinError 5] 拒绝访问。: '\\?\C:\wwwwwww' -> ...`）。
+RENAME_ERROR_TEXT = {
+    5: "拒绝访问（被其他程序占用，或权限不足）",
+    32: "文件正被其他程序使用",
+    33: "文件的一部分被锁定",
+    183: "目标位置已经存在同名目录",
+}
+
+
+def _readable_rename_error(exc: OSError) -> str:
+    """把改名失败说成人话；没收录的错误码退回原文，免得把信息吞掉。"""
+    code = getattr(exc, "winerror", None)
+    known = RENAME_ERROR_TEXT.get(code)
+    if known:
+        return f"{known}（WinError {code}）"
+    return str(exc)
 
 ABORT_TEXT = {
     "disk_full": "目标卷空间不足，已立即停止（继续重试只会把剩下的文件逐个失败一遍）",
@@ -80,6 +103,34 @@ class MigrateOutcome:
     # 这趟运行的日志文件（`<会话>.log`）。失败现场往往已经变了，
     # 光看结构化数据回答不了「几个小时里走到了哪一步」。
     log_path: str = ""
+    # 整趟卡在某一步时的结构化信息（改名失败、建链失败……）。
+    # 只有一句 message 的话，报告页的清单就没东西可列，用户看到的是
+    # 刺眼的红标题配一张空表。
+    blocked_path: str = ""
+    blocked_reason: str = ""
+    blocked_process: str = ""
+
+
+@dataclass
+class RestoreOutcome:
+    """回滚的结果，供报告页把「迁移结果」那一套换成「恢复结果」。
+
+    和 MigrateOutcome 是两回事：那一页回答的是「数据搬过去了吗」，回滚之后
+    该回答的是「原路径回来了吗、目标端那份怎么样了」。统计网格里的
+    复制数、校验缺失数在那一刻都没有意义——那件事已经被撤销了。
+    """
+
+    ok: bool = False
+    source: str = ""
+    source_restored: bool = False
+    backup_path: str = ""
+    # 权限还原的情况，已经是人话（来自 cleanup_error 里那一段）；没接管过就是空串
+    acl_note: str = ""
+    target: str = ""
+    # cleared / kept / skipped / missing / failed，由界面映射成文案
+    target_state: str = ""
+    target_note: str = ""
+    message: str = ""
 
 
 def _same_path(a, b) -> bool:
@@ -94,35 +145,120 @@ def backup_name(source) -> str:
     return f"{Path(source).name}.bak_{stamp}"
 
 
+# kernel32 句柄：rmtree_force 直接用 DeleteFileW / RemoveDirectoryW，
+# 绕开被运行环境 sitecustomize 劫持成「丢回收站」的 shutil.rmtree。
+try:
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+except OSError:  # pragma: no cover - 非 Windows
+    _k32 = None
+
+
+def _delete_file_win32(path) -> bool:
+    """直接调 DeleteFileW 删文件，绕开被 sitecustomize 劫持的 shutil/os.unlink。
+
+    返回是否删掉。失败不抛——调用方按 leftovers 流程处理。
+    """
+    try:
+        return bool(_k32.DeleteFileW(path))
+    except OSError:
+        return False
+
+
+def _remove_dir_win32(path) -> bool:
+    """直接调 RemoveDirectoryW 删空目录，绕开被劫持的 os.rmdir。"""
+    try:
+        return bool(_k32.RemoveDirectoryW(path))
+    except OSError:
+        return False
+
+
+def _force_clear_readonly(path) -> None:
+    """清掉只读位（迁移来的目录常带只读属性，DeleteFileW 删不掉）。"""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except OSError:
+        pass
+
+
 def rmtree_force(path) -> list[str]:
     """删除目录树，返回**没能删掉**的路径清单（空列表代表删干净了）。
 
-    Windows 上只读文件会让 shutil.rmtree 直接抛 PermissionError，
-    迁移来的目录里很可能带只读属性，所以先清掉只读位再重试。
+    直接用 Win32 API（DeleteFileW / RemoveDirectoryW）递归删除，**不走
+    shutil.rmtree**——运行环境（如桌面应用的 sitecustomize）会把
+    shutil.rmtree 劫持成「丢回收站」版，回收站一失败整棵树就删不掉，
+    界面却报不出原因。Win32 直删只对真正被占用句柄锁住的文件失败，
+    那种情况由调用方查占用进程提示用户关闭。
+
     删不掉的项必须如实回报：调用方要据此判断备份是否真的没了，
     否则界面会一边显示「备份已删除」一边把几十 GB 留在盘上。
+
+    顶层本身就是链接类重解析点（junction / 符号链接）时不能跟随：
+    直接摘掉链接本身（RemoveDirectoryW / DeleteFileW），目标数据绝不动。
     """
     leftovers: list[str] = []
-
-    def on_error(func, name, exc):
-        try:
-            os.chmod(name, stat.S_IWRITE)
-            func(name)
-        except OSError:
-            try:
-                # 带未处理标签的目录形态重解析点连 scandir 都失败（WinError 1920），
-                # 摘掉标签就能正常删；否则会被误记成一条「删不掉的残留」。
-                # 链接类（junction / symlink）绝不能摘：那等于动到外部仓库。
-                if not is_link_kind(reparse_kind(os.lstat(long_path(name)))):
-                    reparse.delete_reparse_point(name)
-                func(name)
-            except OSError:
-                leftovers.append(str(name))
+    lp = long_path(path)
 
     try:
-        shutil.rmtree(path, onexc=on_error)
-    except OSError as exc:
-        leftovers.append(f"{path}: {exc}")
+        st = os.lstat(lp)
+    except OSError:
+        return leftovers                       # 不存在 = 删干净了
+    if is_link_kind(reparse_kind(st)):
+        # 链接本身：摘链接，不跟随目标
+        ok = (_remove_dir_win32(lp) if os.path.isdir(lp)
+              else _delete_file_win32(lp))
+        if not ok and os.path.exists(lp):
+            leftovers.append(str(path))
+        return leftovers
+
+    def _recurse(dir_path: str) -> None:
+        try:
+            entries = list(os.scandir(dir_path))
+        except OSError as exc:
+            # 带未处理标签的目录形态重解析点连 scandir 都失败（WinError 1920），
+            # 摘掉标签就能正常删；链接类绝不能摘：那等于动到外部仓库。
+            try:
+                kind = reparse_kind(os.lstat(dir_path))
+                if kind is not None and not is_link_kind(kind):
+                    reparse.delete_reparse_point(dir_path)
+                    entries = list(os.scandir(dir_path))
+                else:
+                    leftovers.append(f"{dir_path}: {exc}")
+                    return
+            except OSError:
+                leftovers.append(f"{dir_path}: {exc}")
+                return
+        for entry in entries:
+            full = long_path(entry.path)
+            try:
+                st_entry = os.lstat(full)
+            except OSError:
+                continue
+            if is_link_kind(reparse_kind(st_entry)):
+                # 子项是链接：摘链接本身，不跟随
+                ok = (_remove_dir_win32(full) if entry.is_dir(follow_symlinks=False)
+                      else _delete_file_win32(full))
+                if not ok and os.path.exists(full):
+                    leftovers.append(str(entry.path))
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                _recurse(full)
+                # 子项删完后再删这个目录本身
+                if not _remove_dir_win32(full):
+                    _force_clear_readonly(full)
+                    if not _remove_dir_win32(full) and os.path.exists(full):
+                        leftovers.append(str(entry.path))
+            else:
+                if not _delete_file_win32(full):
+                    _force_clear_readonly(full)
+                    if not _delete_file_win32(full) and os.path.exists(full):
+                        leftovers.append(str(entry.path))
+
+    _recurse(lp)
+    # 顶层目录
+    if os.path.exists(lp) and not _remove_dir_win32(lp):
+        _force_clear_readonly(lp)
+        if not _remove_dir_win32(lp) and os.path.exists(lp):
+            leftovers.append(str(path))
     return leftovers
 
 
@@ -146,12 +282,35 @@ class Migrator:
         self.cleanup_error: str = ""
         self._link_created = False
         self.runlog: RunLog | None = None
+        # 卡住时的结构化信息，由 _rename_source_to_backup 之类填，再带给报告页
+        self.blocked_reason = ""
+        self.blocked_process = ""
+        # 逐行日志的界面接收方。可以由界面在构造之后再挂上（worker 就是这么做的），
+        # 所以 _ensure_runlog 里传的是 self._emit_log 这个间接层、而不是当时的取值。
+        self.log_sink = None
 
     # --- 日志 -------------------------------------------------------
     def _ensure_runlog(self) -> None:
         """会话一旦就位，就把日志挂到它旁边（`<id>.log`，与 `.json`/`.done` 同前缀）。"""
         if self.session is not None and self.runlog is None:
-            self.runlog = RunLog(self.session.path.with_suffix(LOG_SUFFIX))
+            self.runlog = RunLog(self.session.path.with_suffix(LOG_SUFFIX),
+                                 on_line=self._emit_log)
+
+    def _emit_log(self, line: str) -> None:
+        """把一行日志转给界面。界面侧出问题绝不能影响迁移本身。
+
+        try/except 在这里是**载荷**而不是装饰：接收方是界面挂在 worker 信号上的
+        方法，worker 一旦被释放，那个信号就成了死对象，调用会抛 RuntimeError。
+        界面会显式摘掉它（main_window._on_worker_finished），但这里仍要兜住——
+        日志本身必须照写不误。
+        """
+        sink = self.log_sink
+        if sink is None:
+            return
+        try:
+            sink(line)
+        except Exception:
+            pass
 
     def _log(self, message: str) -> None:
         if self.runlog is not None:
@@ -506,7 +665,10 @@ class Migrator:
             self.session.phase = "rename_failed"
             self.session.save()
             return MigrateOutcome(False, "rename_failed", copy=copy_result,
-                                  verify=verify_result, message=rename_error)
+                                  verify=verify_result, message=rename_error,
+                                  blocked_path=str(self.source),
+                                  blocked_reason=self.blocked_reason,
+                                  blocked_process=self.blocked_process)
         self.session.phase = "renamed"
         self.session.backup_path = self.backup_path
         self.session.save()
@@ -574,10 +736,10 @@ class Migrator:
     def _rename_source_to_backup(self) -> tuple[str, str]:
         """把源目录改名为备份，返回 (备份路径, 失败原因)；成功时原因为空串。
 
-        改名要求整棵树无人持有句柄：资源管理器开着某个子目录、终端 cwd 在里面、
-        杀软正在扫，都会让它失败于 ACCESS_DENIED / SHARING_VIOLATION。这类冲突
-        多半是瞬时的，所以先退避重试；仍然失败才去查占用——原来只试一次、
-        只回一句 WinError 5，用户既不知道该关什么，也没有下一步可走。
+        改名要求整棵树无人持有句柄：资源管理器开着某个子目录、杀软正在扫，
+        都会让它失败于 ACCESS_DENIED / SHARING_VIOLATION。这类冲突多半是瞬时的，
+        所以先退避重试；仍然失败才去查占用——原来只试一次、只回一句 WinError 5，
+        用户既不知道该关什么，也没有下一步可走。
         """
         backup = str(self.source.parent / backup_name(self.source))
         last = ""
@@ -586,44 +748,32 @@ class Migrator:
                 time.sleep(delay)
             try:
                 os.rename(long_path(self.source), long_path(backup))
+                self.blocked_reason = ""
+                self.blocked_process = ""
                 return backup, ""
             except OSError as exc:
-                last = str(exc)
+                last = _readable_rename_error(exc)
         held = self._blocking_processes()
+        # 结构化留存：报告页的「未完成清单」靠它出一条**可读**的记录，
+        # 而不是只把整段文字塞进 message 就没了。
+        self.blocked_reason = last
+        self.blocked_process = held
         if held:
-            last = f"{last}；正在占用源目录的进程：{held}。关掉它们后重试即可"
+            last = (f"改名失败：{last}。正在占用源目录的进程：{held}。"
+                    f"关掉它们后重试即可；源目录未改动，目标端已有完整副本")
         else:
-            last = (f"{last}；未查出占用进程（可能是某个进程的当前目录在源目录里，"
-                    f"或权限不足）。源目录未改动，目标端已有完整副本")
+            last = (f"改名失败：{last}；未查出占用进程（可能是权限不足，"
+                    f"或有进程正把源目录当作工作目录）。"
+                    f"源目录未改动，目标端已有完整副本")
         return "", last
 
     def _blocking_processes(self, limit: int = RENAME_LOCK_SAMPLE) -> str:
         """采样源树里的文件，问重启管理器是谁占着。
 
-        RM 实测注册目录查不到任何进程，只能拿文件去问；而诊断要的答案是
-        「关掉哪个程序」，采样足够，不值得为此再完整遍历几十万个文件。
+        采样逻辑挪到了 `locks.blockers_in_tree`——改名前的试探（guard.probe_rename）
+        也要用同一份，两处各写一遍迟早分叉。
         """
-        sample: list[str] = []
-        for root, dirs, files in os.walk(long_path(self.source)):
-            keep = []
-            for name in dirs:
-                full = os.path.join(root, name)
-                try:
-                    if reparse_kind(os.lstat(full)) is None:
-                        keep.append(name)
-                except OSError:
-                    continue
-            dirs[:] = keep
-            for name in files:
-                sample.append(os.path.join(root, name))
-                if len(sample) >= limit:
-                    break
-            if len(sample) >= limit:
-                break
-        if not sample:
-            return ""
-        held = locks.who_locks_many(sample)
-        return ", ".join(f"{p.name} ({p.pid})" for p in held)
+        return locks.describe(locks.blockers_in_tree(self.source, limit))
 
     # --- 收尾与回滚 -------------------------------------------------
     def skipped_reparse_count(self) -> int:
@@ -678,6 +828,162 @@ class Migrator:
         self._log(f"删除备份：完成（force={force}）{self.backup_path}")
         return True
 
+    def target_extras(self, limit: int | None = None,
+                      ledger: set[str] | None = None) -> list[str]:
+        """目标端里「不属于这次迁移」的文件（相对路径）。
+
+        依据是本会话的复制记账：目标端只该有记账里的那些条目，多出来的就是迁移
+        之后被写进去的（用户在那儿跑构建、下载文件）。回滚时顺手删掉它们等于
+        静默销毁用户的数据，所以删之前先问一遍。
+
+        遍历规则必须和记账对齐：**只取普通文件、不跟进任何重解析点**。
+        迁移在目标端重建的链接不进记账（它们在第 2 趟单独建），所以这里也要
+        排除，否则每条重建出来的链接都会被误判成用户后写入的数据。
+        未知重解析点是**进**记账的（它们走复制路径），但这里跳过它们只是不参与
+        比对——不会被算成 extras，不影响结论。
+
+        `limit` 只影响返回条数（界面展示用），判定「有没有」不受影响。
+        `ledger` 允许调用方把已经读好的记账传进来：几十万行时读两遍纯属浪费。
+        """
+        if self.session is None:
+            return []
+        if ledger is None:
+            ledger = self.session.completed_rels()
+        if not ledger:
+            return []
+        target = long_path(self.target)
+        if not os.path.isdir(target):
+            return []
+        extras: list[str] = []
+        for dirpath, dirs, files in os.walk(target):
+            keep = []
+            for name in dirs:
+                full = os.path.join(dirpath, name)
+                try:
+                    if reparse_kind(os.lstat(full)) is None:
+                        keep.append(name)
+                except OSError:
+                    continue
+            dirs[:] = keep
+            for name in files:
+                full = os.path.join(dirpath, name)
+                try:
+                    if reparse_kind(os.lstat(full)) is not None:
+                        continue        # 链接 / 未知重解析点：不在比对范围
+                except OSError:
+                    continue
+                rel = rel_to(full, self.target)
+                if rel not in ledger:
+                    extras.append(rel)
+                    if limit is not None and len(extras) >= limit:
+                        return extras
+        return extras
+
+    def has_target(self) -> bool:
+        """目标目录现在还在不在。
+
+        回滚后要判断「还有没有东西可清」：目标端本来就不存在时，
+        再走一遍删除只会得到「目标目录不存在，无需清理」这种自相矛盾的结论
+        （说「未能删除」又说「无需清理」）。
+        """
+        return os.path.exists(long_path(self.target))
+
+    def can_clear_target(self) -> tuple[bool, str]:
+        """回滚后能不能安全地自动清掉目标端。返回 (能否, 不能的原因)。
+
+        判据只有一条：目标端里除了这次复制过去的东西，没有别的。
+        没有记账时一律拒绝——确认不了就不动手，和 discard_target 同一个原则。
+        """
+        if self.session is None:
+            return False, "没有会话记账，无法确认目标端里有没有迁移之后写入的数据"
+        ledger = self.session.completed_rels()
+        if not ledger:
+            return False, "没有会话记账，无法确认目标端里有没有迁移之后写入的数据"
+        if not os.path.exists(long_path(self.target)):
+            return True, ""
+        extras = self.target_extras(limit=21, ledger=ledger)
+        if extras:
+            shown = "、".join(extras[:3])
+            more = f" 等 {len(extras)} 项" if len(extras) > 3 else ""
+            return False, (f"目标端有 {len(extras)} 项不属于这次迁移的内容"
+                           f"（{shown}{more}），删掉会一并销毁它们")
+        return True, ""
+
+    def clear_target(self) -> bool:
+        """清空目标目录**里面的东西**，但保留目录本身。
+
+        和 discard_target 只差这一点：那个连目录一起删（「删除目标」按钮与 CLI 的
+        discard 就是这个语义）。回滚要的不是这个——用户要的是「把同步过去的内容
+        去掉」，而目标目录完全可能是他自己先建好的空目录（合入已有目录是被支持的
+        场景，guard 里专门有 target_not_empty 这一条）。把整个目录删掉，等于顺手
+        清掉了一个用户自己建的文件夹。
+
+        安全性判断与 discard_target 完全一致：确认数据另有副本才动手。
+        """
+        self.cleanup_error = ""
+        self._ensure_runlog()
+        if is_reparse_path(self.source):
+            self.cleanup_error = "源目录已经是指向目标的链接，目标端是活数据，不能清"
+            self._log(f"清空目标：被拒（{self.cleanup_error}）")
+            return False
+        backup_ok = bool(self.backup_path) and os.path.exists(
+            long_path(self.backup_path))
+        if not os.path.isdir(long_path(self.source)) and not backup_ok:
+            self.cleanup_error = "源目录与备份都不在，无法确认数据另有副本，拒绝清空目标"
+            self._log(f"清空目标：被拒（{self.cleanup_error}）")
+            return False
+        target = long_path(self.target)
+        if not os.path.isdir(target):
+            self.cleanup_error = "目标目录不存在，无需清理"
+            self._log(f"清空目标：被拒（{self.cleanup_error}）")
+            return False
+
+        leftovers: list[str] = []
+        try:
+            entries = list(os.scandir(target))
+        except OSError as exc:
+            self.cleanup_error = f"目标目录读不出来：{exc}"
+            self._log(f"清空目标：被拒（{self.cleanup_error}）")
+            return False
+        for entry in entries:
+            full = long_path(entry.path)
+            try:
+                st_entry = os.lstat(full)
+            except OSError:
+                continue
+            # 目录与链接都交给 rmtree_force：它认链接、只摘链接本身。
+            # 普通文件不能交给它——它内部走 scandir，对文件会直接报「删不掉」。
+            if is_link_kind(reparse_kind(st_entry)) or entry.is_dir(
+                    follow_symlinks=False):
+                leftovers.extend(rmtree_force(full))
+            else:
+                if not _delete_file_win32(full):
+                    _force_clear_readonly(full)
+                    if not _delete_file_win32(full) and os.path.exists(full):
+                        leftovers.append(str(entry.path))
+
+        remaining = []
+        try:
+            remaining = [e.path for e in os.scandir(target)]
+        except OSError:
+            pass
+        if remaining:
+            sample = "；".join(os.path.basename(p.rstrip("\\/"))
+                              for p in remaining[:3])
+            self.cleanup_error = (
+                f"目标目录里有 {len(remaining)} 项没能清掉（{sample}），"
+                f"目录仍在：{self.target}")
+            self._log(f"清空目标：未清干净，{self.cleanup_error}")
+            return False
+
+        if self.session:
+            # 清空目标端不写会话 phase：这是回滚之后的收尾动作，不是迁移本身的新
+            # 结局。写成 "discarded" 会把回滚刚记下的 "rolled_back" 盖掉，会话文件
+            # 里就再也看不出「回滚发生过」了。清了什么已经落在运行日志里。
+            self.session.save()
+        self._log(f"清空目标：完成（目录保留）{self.target}")
+        return True
+
     def discard_target(self) -> bool:
         """删掉半成品目标目录。返回是否真的删干净了，原因写在 cleanup_error。
 
@@ -721,29 +1027,57 @@ class Migrator:
 
         先还原权限再动目录：接管改的是源树上的属主与访问控制，回滚不退回
         等于把用户的权限配置永久改掉了。
+
+        **唯一会拒绝的情形：源路径是链接、却没有可还原的备份。**
+        迁移成功后命令行默认会删掉备份，此时源路径上那条链接是用户程序
+        唯一的入口；摘掉它而不还原，等于把原路径抹掉——用户看到「回滚成功」，
+        实际所有引用原路径的程序、快捷方式、脚本全部失效。这种组合一律拒绝，
+        且什么都不动（连 ACL 也不碰，被拒的操作不留副作用）。
+
+        其余情况照常执行：ACL 还原不依赖备份，源是普通目录时也没有结构可还原。
         """
         self.cleanup_error = ""
         self._ensure_runlog()
+
+        has_backup = bool(self.backup_path) and os.path.exists(
+            long_path(self.backup_path))
+        source_is_link = is_reparse_path(self.source)
+        if source_is_link and not has_backup:
+            self.cleanup_error = (
+                "没有可还原的备份（备份已被删除）。源路径上的链接是当前唯一入口，"
+                "摘掉它会让这个路径彻底消失，因此拒绝回滚；数据在目标端完好。")
+            self._log(f"回滚：被拒（{self.cleanup_error}）")
+            return False
+
         acl_failed = self._restore_acl()
         if acl_failed:
             preview = "；".join(acl_failed[:3])
             self.cleanup_error = (f"{len(acl_failed)} 个目录的原始权限没能还原"
                                   f"（示例：{preview}），它们仍是接管后的属主。")
 
-        if self._link_created or is_reparse_path(self.source):
+        if source_is_link:
+            # 只在**确实存在一条链接**时才摘。链接已经不在了（被外部删掉、
+            # 或上一趟回滚已经摘过）就直接去还原备份——那种现场下回滚是
+            # 唯一的恢复手段，卡在摘链接这一步会让数据永远锁在备份里。
             try:
                 os.rmdir(long_path(self.source))
             except OSError:
                 try:
                     os.unlink(long_path(self.source))
                 except OSError:
-                    self._log("回滚：摘掉源目录链接失败")
+                    self.cleanup_error = (
+                        f"摘掉源路径上的链接失败：{self.source}，回滚中止")
+                    self._log(f"回滚：{self.cleanup_error}")
                     return False
-        if self.backup_path and os.path.exists(long_path(self.backup_path)):
+        if has_backup:
             try:
                 os.rename(long_path(self.backup_path), long_path(self.source))
-            except OSError:
-                self._log(f"回滚：备份改回原名失败 {self.backup_path}")
+            except OSError as exc:
+                reason = getattr(exc, "strerror", None) or str(exc)
+                self.cleanup_error = (
+                    f"备份改回原名失败（{reason}）。备份仍在 {self.backup_path}，"
+                    f"{self.source} 未被改动")
+                self._log(f"回滚：{self.cleanup_error}")
                 return False
         if self.session:
             self.session.phase = "rolled_back"

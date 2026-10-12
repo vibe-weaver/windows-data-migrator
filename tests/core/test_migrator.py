@@ -29,6 +29,183 @@ def _migrator(tmp_path, src):
     return Migrator(src, tmp_path / "dst", session_root=tmp_path / "sessions")
 
 
+# --- 回滚后自动清目标端：先判断「目标端有没有迁移之外的内容」--------------
+#
+# 会话有一本复制记账（<id>.done），记的是本会话自己复制过哪些相对路径。
+# 目标端多出来的条目就是迁移之后被写进去的（用户在那儿跑构建、下载文件），
+# 回滚时若顺手删掉，等于静默销毁他的数据。
+
+def test_clean_migration_leaves_no_extras(tmp_path):
+    src, _ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    assert m.execute().ok is True
+
+    assert m.target_extras() == []
+    ok, reason = m.can_clear_target()
+    assert ok is True
+    assert reason == ""
+
+
+def test_files_written_after_the_migration_are_extras(tmp_path):
+    src, _ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    m.execute()
+
+    dst = tmp_path / "dst"
+    (dst / "新下载的电影.mp4").write_bytes(b"x" * 10)
+    (dst / "a" / "跑构建生成的.log").write_text("build", encoding="utf-8")
+
+    extras = m.target_extras()
+    assert sorted(extras) == ["a\\跑构建生成的.log", "新下载的电影.mp4"]
+
+    ok, reason = m.can_clear_target()
+    assert ok is False
+    assert "不属于这次迁移" in reason
+    assert "2 项" in reason
+
+
+def test_rebuilt_links_are_not_extras(tmp_path):
+    """迁移会在目标端重建链接，那是迁移的正常产物，不是「多出来的内容」。
+
+    链接不进复制记账（它们在第 2 趟单独重建），所以拿记账比对时，
+    遍历目标端必须同样排除链接——否则每条重建出来的链接都会被误判成
+    用户后写入的数据，自动清理永远被拒。
+    """
+    src, ext = _tree(tmp_path)          # _tree 里有一个指向树外的 junction
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    assert m.execute().ok is True
+    assert (tmp_path / "dst" / "link-pkg").exists()
+
+    assert m.target_extras() == []
+    assert m.can_clear_target()[0] is True
+
+
+def test_without_a_ledger_we_refuse_to_clear(tmp_path):
+    """没有记账就确认不了，宁可拒绝自动清理。"""
+    src, _ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    m.execute()
+    m.session = None
+
+    ok, reason = m.can_clear_target()
+    assert ok is False
+    assert "记账" in reason
+
+
+def test_clearing_target_removes_the_migrated_copy(tmp_path):
+    """确认可以清时，清完目标端目录不再存在。"""
+    src, _ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    m.execute()
+    m.rollback()
+
+    assert m.can_clear_target()[0] is True
+    assert m.discard_target() is True
+    assert not (tmp_path / "dst").exists()
+
+
+# --- 回滚时清目标端：只清内容，保留目录本身 -----------------------------
+#
+# discard_target 连目录一起删（那是「删除目标」按钮的语义，CLI 的 discard 也是）。
+# 回滚要的不是这个：用户要的是「把同步过去的内容去掉」，而目标目录很可能是他
+# 自己先建好的空目录（合入已有目录是被支持的场景，guard 里就有 target_not_empty）。
+# 删掉整个目录等于顺手清掉了一个用户自己建的文件夹。
+
+def test_clear_target_keeps_the_directory_itself(tmp_path):
+    src, _ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    m.execute()
+    m.rollback()
+
+    assert m.clear_target() is True
+    assert (tmp_path / "dst").is_dir(), "目录本身必须留着"
+    assert list((tmp_path / "dst").iterdir()) == [], "里面应当清空"
+
+
+def test_clear_target_unlinks_rebuilt_links_without_following(tmp_path):
+    """目标端重建出来的链接要摘掉，但绝不能跟随删到外部仓库的数据。"""
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    m.execute()
+    m.rollback()
+    assert (tmp_path / "dst" / "link-pkg").exists()
+
+    assert m.clear_target() is True
+
+    assert not (tmp_path / "dst" / "link-pkg").exists()
+    assert (ext / "index.js").exists(), "外部仓库的数据一个字节都不能动"
+
+
+def test_clear_target_does_not_clobber_the_rolled_back_phase(tmp_path):
+    """清空目标端不该改写会话 phase。
+
+    它是回滚之后的收尾动作，不是迁移本身的新结局。写成 "discarded" 会把回滚刚
+    记下的 "rolled_back" 盖掉，会话文件里就再也看不出「回滚发生过」了。
+    """
+    src, _ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    m.execute()
+    assert m.rollback() is True
+    assert m.session.phase == "rolled_back"
+
+    assert m.clear_target() is True
+
+    assert m.session.phase == "rolled_back"
+
+
+def test_clear_target_refuses_when_the_source_is_a_link(tmp_path):
+    """源还是链接时目标端是活数据，不能清——和 discard_target 同一条底线。"""
+    src, _ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    m.execute()                       # 成功后源就是链接了
+
+    assert m.clear_target() is False
+    assert (tmp_path / "dst" / "two.bin").exists()
+    assert "活数据" in m.cleanup_error
+
+
+def test_clear_target_without_a_copy_to_fall_back_on(tmp_path):
+    src, _ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    m.plan = m.plan_it()
+    m.execute()
+    m.rollback()
+    m.backup_path = None
+    src.rename(tmp_path / "gone")
+
+    assert m.clear_target() is False
+    assert "无法确认" in m.cleanup_error
+
+
+def test_rmtree_force_removes_top_level_junction_without_following(tmp_path):
+    """rmtree_force 直接删一个**顶层** junction 时，要摘掉链接本身、不跟随删目标数据。
+
+    原来 shutil.rmtree 跟随 junction 进目标仓库、又删不掉链接本身，最后还误报空清单
+    （leftovers=[] 但链接仍在、目标数据险被删）。入口先判顶层是链接类重解析点：
+    是则直接 rmdir/unlink 摘链接，绝不进 rmtree。生产路径（备份/目标都是真实目录）
+    本来不触达顶层链接，但契约「空清单=删干净了」必须名副其实。
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "precious.txt").write_text("keep", encoding="utf-8")
+    link = tmp_path / "link_to_repo"
+    reparse.create_junction(link, repo)
+    leftovers = migrator_mod.rmtree_force(link)
+    assert not os.path.lexists(link), "顶层 junction 应被摘掉"
+    assert (repo / "precious.txt").read_text(encoding="utf-8") == "keep", \
+        "目标数据绝不能被跟随删除"
+    assert leftovers == [], "摘掉了就该报空清单，不能误报成功"
+
+
 def test_full_migration_creates_link_and_backup(tmp_path):
     src, ext = _tree(tmp_path)
     dst = tmp_path / "dst"
@@ -86,6 +263,72 @@ def test_rollback_restores_source(tmp_path, monkeypatch):
     assert os.path.isdir(src)
     assert not (src and os.lstat(src).st_file_attributes & stat_mod.FILE_ATTRIBUTE_REPARSE_POINT)
     assert (src / "two.bin").read_bytes() == b"2" * 500
+
+
+def test_rollback_refuses_when_backup_is_gone(tmp_path):
+    """备份已不存在时回滚必须**拒绝**，绝不能把源路径上的链接摘掉。
+
+    这是**默认流程**：CLI 迁移成功后会自动删除备份。此时源路径上那条链接
+    是用户程序唯一的入口。原来 rollback 摘链接是无条件的、还原备份是有条件的，
+    又无条件 return True —— 备份不在时就成了「报成功 + 原路径消失」。
+    """
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+    assert out.ok is True
+    # 模拟迁移成功后的自动清理（CLI 不加 --keep-backup 就是这个结果）
+    migrator_mod.rmtree_force(m.backup_path)
+    assert not os.path.exists(m.backup_path)
+
+    assert m.rollback() is False, "没有可还原的原件时必须拒绝"
+    assert m.cleanup_error, "拒绝时要给出原因，不能默默返回 False"
+    assert os.path.exists(src), "源路径绝不能被摘掉"
+    assert os.lstat(src).st_file_attributes & stat_mod.FILE_ATTRIBUTE_REPARSE_POINT, \
+        "源路径应仍是那条链接"
+    assert (src / "two.bin").read_bytes() == b"2" * 500, "经源路径仍要能读到数据"
+
+
+def test_rollback_restores_backup_when_source_link_is_gone(tmp_path):
+    """源路径上的链接已经被外部删掉、备份还在时，必须把备份还原回去。
+
+    回滚是这种现场**唯一**的恢复手段：数据锁在备份里、原路径空着。
+    原来只要 `_link_created` 为真就去摘链接，摘不到就直接 return False，
+    备份永远不会被还原；而且那条失败分支没设 cleanup_error，
+    界面/命令行只能显示「未知原因」。
+    """
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+    assert out.ok is True
+    backup = m.backup_path
+    os.rmdir(str(src))                     # 模拟外部删掉源路径上的链接
+    assert not os.path.exists(src)
+
+    assert m.rollback() is True, f"应还原备份，实际被拒：{m.cleanup_error!r}"
+    assert os.path.isdir(src)
+    assert not (os.lstat(src).st_file_attributes
+                & stat_mod.FILE_ATTRIBUTE_REPARSE_POINT)
+    assert (src / "two.bin").read_bytes() == b"2" * 500
+    assert not os.path.exists(backup), "备份应已被改回原名"
+
+
+def test_rollback_failure_always_explains_itself(tmp_path):
+    """源被换成了真实目录、备份还在：拒绝覆盖是对的，但必须说明原因。
+
+    没有原因时界面与命令行只能显示「未知原因」，用户完全不知道该做什么。
+    """
+    src, ext = _tree(tmp_path)
+    m = _migrator(tmp_path, src)
+    out = m.execute()
+    assert out.ok is True
+    os.rmdir(str(src))
+    (src / "a").mkdir(parents=True)        # 源位置冒出一个真实目录
+    (src / "marker.txt").write_text("mine", encoding="utf-8")
+
+    assert m.rollback() is False
+    assert m.cleanup_error, "失败时必须给出原因"
+    assert (src / "marker.txt").read_text(encoding="utf-8") == "mine", \
+        "拒绝时不能动源里已有的东西"
 
 
 def test_verify_failure_keeps_source_intact(tmp_path, monkeypatch):
@@ -213,15 +456,14 @@ def test_cleanup_backup_reports_leftovers(tmp_path, monkeypatch):
     m = _migrator(tmp_path, src)
     out = m.execute()
     assert out.ok
-    real_unlink = os.unlink
 
-    def deny(path, *args, **kwargs):
-        # rmtree 传进来的是带 \?\ 前缀的路径，只能按文件名匹配
-        if os.path.basename(str(path)) == "two.bin":
-            raise PermissionError(13, "拒绝访问", str(path))
-        return real_unlink(path, *args, **kwargs)
+    # rmtree_force 现在用 Win32 API 直删（绕开被运行环境劫持的 shutil.rmtree），
+    # 让删除函数失败来制造「删不掉」场景，验证残留清单如实回报、cleanup_backup
+    # 返回 False、备份仍在、会话不被标记成 cleaned。
+    from dmig.core import migrator as _mig
 
-    monkeypatch.setattr(os, "unlink", deny)
+    monkeypatch.setattr(_mig, "_delete_file_win32", lambda p: False)
+    monkeypatch.setattr(_mig, "_remove_dir_win32", lambda p: False)
     assert m.cleanup_backup() is False
     assert m.cleanup_error
     assert os.path.exists(out.backup_path)
@@ -1103,18 +1345,44 @@ def test_run_log_accumulates_instead_of_overwriting(tmp_path):
 
 
 def test_rollback_and_cleanup_leave_a_log_line(tmp_path):
-    """回滚与删备份都是破坏性动作，事后必须查得到「谁做的、做成没有」。"""
+    """回滚与删备份都是破坏性动作，事后必须查得到「谁做的、做成没有」。
+
+    两件事各跑一趟。原来这条测试是「先 cleanup_backup() 删掉备份，再 rollback()
+    并期望成功」——它恰好把「备份没了还能回滚」这个缺陷当成了正确行为，
+    而那个组合会让源路径彻底消失。现在那种组合会被拒绝（见下一条测试）。
+    """
+    # 第一趟：删备份
+    case_a = tmp_path / "case_a"
+    case_a.mkdir()
+    src_a, _ext_a = _tree(case_a)
+    m_a = _migrator(case_a, src_a)
+    out_a = m_a.execute()
+    assert out_a.ok, f"{out_a.phase} {out_a.message}"
+    assert m_a.cleanup_backup() is True
+    with open(out_a.log_path, encoding="utf-8") as handle:
+        assert "删除备份：完成" in handle.read()
+
+    # 第二趟：回滚（备份还在，才走得通）
+    case_b = tmp_path / "case_b"
+    case_b.mkdir()
+    src_b, _ext_b = _tree(case_b)
+    m_b = _migrator(case_b, src_b)
+    out_b = m_b.execute()
+    assert out_b.ok, f"{out_b.phase} {out_b.message}"
+    assert m_b.rollback() is True
+    with open(out_b.log_path, encoding="utf-8") as handle:
+        assert "回滚：完成" in handle.read()
+
+
+def test_refused_rollback_is_also_logged(tmp_path):
+    """被拒的回滚同样要留痕，否则用户事后查不到「为什么没回滚」。"""
     src, ext = _tree(tmp_path)
     m = _migrator(tmp_path, src)
     out = m.execute()
-    assert out.ok, f"{out.phase} {out.message}"
+    assert out.ok
+    migrator_mod.rmtree_force(m.backup_path)
 
-    assert m.cleanup_backup() is True
-    text = _log_text(out)
-    assert "删除备份：完成" in text
-
-    log_path = out.log_path
-    assert m.rollback() is True
-    with open(log_path, encoding="utf-8") as handle:
-        assert "回滚：完成" in handle.read()
+    assert m.rollback() is False
+    with open(out.log_path, encoding="utf-8") as handle:
+        assert "回滚：被拒" in handle.read()
 
