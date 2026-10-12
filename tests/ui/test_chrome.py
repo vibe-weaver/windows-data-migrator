@@ -12,7 +12,7 @@ def qapp():
 
 def test_brand_bar_shows_app_name(qapp):
     bar = chrome.BrandBar()
-    assert "数据目录迁移工具" in bar.title_text()
+    assert chrome.APP_NAME in bar.title_text()
 
 
 def test_step_bar_marks_done_current_todo(qapp):

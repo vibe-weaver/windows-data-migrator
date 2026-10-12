@@ -25,37 +25,33 @@ def test_semantic_colors_are_light_dark_pairs():
         assert all(c.startswith("#") and len(c) == 7 for c in pair)
 
 
-def test_modes_cover_auto_light_dark():
-    assert set(theme.MODES) == {"auto", "light", "dark"}
+def test_theme_is_pinned_to_light():
+    """深色已从产品移除：唯一模式是 light。"""
+    assert set(theme.MODES) == {"light"}
 
 
-def test_resolve_mode_accepts_known_values():
-    for m in theme.MODES:
-        assert theme.resolve_mode(m) == m
+def test_resolve_mode_always_returns_light():
+    assert theme.resolve_mode("light") == "light"
+    assert theme.resolve_mode("") == "light"
+    assert theme.resolve_mode(None) == "light"
+    assert theme.resolve_mode("rainbow") == "light"
+    assert theme.resolve_mode("dark") == "light"
 
 
-def test_resolve_mode_falls_back_to_auto():
-    assert theme.resolve_mode("") == "auto"
-    assert theme.resolve_mode(None) == "auto"
-    assert theme.resolve_mode("rainbow") == "auto"
-    assert theme.resolve_mode("DARK") == "dark"
-
-
-def test_apply_theme_light_then_dark(qapp):
+def test_apply_theme_is_light_no_matter_what(qapp):
     theme.apply_theme("light")
-    light = theme.is_dark()
+    assert theme.is_dark() is False
     theme.apply_theme("dark")
-    dark = theme.is_dark()
-    assert light is False
-    assert dark is True
-    theme.apply_theme("auto")            # 复原，避免影响其它用例
-
-
-def test_apply_theme_auto_does_not_raise(qapp):
+    assert theme.is_dark() is False
     theme.apply_theme("auto")
-    assert isinstance(theme.is_dark(), bool)
+    assert theme.is_dark() is False
 
 
 def test_apply_theme_tolerates_bad_mode(qapp):
     theme.apply_theme("nonsense")        # 不得抛异常
-    assert isinstance(theme.is_dark(), bool)
+    assert theme.is_dark() is False
+
+
+def test_pick_always_takes_the_light_value():
+    assert theme.pick(("#aaaaaa", "#bbbbbb")) == "#aaaaaa"
+    assert theme.error_color() == theme.ERROR[0]
