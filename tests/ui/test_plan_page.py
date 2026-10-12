@@ -6,7 +6,7 @@ import pytest
 from dmig.core.models import (EntryKind, LinkPlan, LinkTargetClass,
                               MigrationPlan, PlanTotals, TargetGroup,
                               UnknownReparse)
-from dmig.ui.plan_page import LOCK_HINT, PlanPage
+from dmig.ui.plan_page import LOCK_HINT, PlanPage, mapping_summary
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows")
 
@@ -288,13 +288,96 @@ def test_clearing_cell_cancels_persisted_mapping(page):
     assert page.mappings() == {}
 
 
-def test_typing_directly_into_cell_is_remembered(page, qtbot):
-    """用户不打 set_mapping、直接在单元格里打字，也要能跨重扫存活。"""
+def test_typing_into_the_editor_is_remembered(page, qtbot):
+    """用户在输入框里打字（不走 set_mapping），也要能跨重扫存活。"""
     page.load(_plan())
-    item = page.group_table.item(0, 2)
-    item.setText(r"E:\typed-cache")
+    page.mapping_editor(0).setText(r"E:\typed-cache")
     page.load(_plan())
     assert page.mappings() == {NPM_CACHE: r"E:\typed-cache"}
+
+
+# --- 「重写为」必须像个输入框；结果必须看得见 ---------------------------
+
+def test_mapping_column_is_a_real_input_box(page):
+    """「重写为」要一眼看出是能输入的框。
+
+    原来它只是个普通表格单元格，没有任何视觉提示——第一次用根本不知道那里
+    能填（真实反馈：「不仔细看根本看不到」）。
+    """
+    from PySide6.QtWidgets import QLineEdit
+
+    page.load(_plan())
+
+    editor = page.mapping_editor(0)
+    assert isinstance(editor, QLineEdit), "必须是真正的输入控件"
+    assert editor.placeholderText(), "要有占位提示，空着也看得出能填"
+    assert editor.text() == ""
+
+
+def test_derived_target_column_shows_the_effective_target(page):
+    """新增的「迁移后指向」列：填了映射就显示新位置，没填就等于原样。
+
+    这是「点应用看不出变化」的根治——结果直接摆在表格里，
+    而左边那列是分组前缀（原始指向），永远不会变。
+    """
+    page.load(_plan())
+
+    assert page.derived_target_text(0) == NPM_CACHE, "没填映射时等于原样"
+
+    page.set_mapping(0, r"E:\npm-cache")
+
+    assert page.derived_target_text(0) == r"E:\npm-cache", "填完立刻可见"
+
+
+def test_derived_target_updates_while_typing(page):
+    """在输入框里打字时结果列要跟着变，不用先点应用。"""
+    page.load(_plan())
+    page.mapping_editor(0).setText(r"E:\typed")
+    assert page.derived_target_text(0) == r"E:\typed"
+
+
+def test_group_caption_states_the_prerequisite(page):
+    """说明里必须讲清前提：工具不会替你搬那个目录，而且要讲对**什么条件才该填**。
+
+    原来的措辞是「只有你已经把该目录搬到别处时才填」——这个条件不充分，会让人
+    以为「凡是要迁移那个目录就得填」。实测：把外部目录迁移成链接之后原路径照常
+    可用，链接会自己穿过那一层（两跳 junction 链读得到数据）；只有把中间那一跳
+    删掉才断。所以真正的条件是**旧路径此后不再存在**。
+    """
+    text = page.group_caption_text()
+
+    assert "留空" in text, "要说明留空的含义"
+    assert "不会" in text or "不搬" in text, "要写明工具不搬运那个目录"
+    assert "不再存在" in text, "真正的条件是旧路径此后不再存在"
+
+
+def test_unknown_reparse_card_explains_what_it_is(page):
+    """这张卡片对用户完全是陌生的，必须解释清楚是什么、默认怎么处理、勾了会怎样。
+
+    云占位符（OneDrive 按需文件）、AppExecLink、Dedup 都落在这里，而
+    「跳过 + 删备份」是不可逆的——光靠一行标题和一句复选框说明远远不够：
+    用户既不知道这些东西是什么，也不知道不勾会触发云端下载。
+    """
+    text = page.unknown_caption_text()
+
+    assert "链接" in text, "要讲清它『不是链接』"
+    assert "云占位符" in text and "AppExecLink" in text, "要举出典型类型"
+    assert "下载" in text, "要说明不勾的代价：云占位符会触发下载"
+    assert "备份" in text, "要说明勾选后的后果：只留在备份里"
+    assert "不再需要" in text or "确认" in text, "要提醒用户确认"
+
+
+def test_summary_does_not_push_a_pointless_mapping(page):
+    """摘要那句「若那些目录也要迁移，请填写新路径」会把用户带偏。
+
+    把外部目录迁移成链接之后原路径仍然可用，链接会自己穿过去，根本不需要映射。
+    真实案例：用户照着这句话填了映射，结果链接指向一个空目录，数据反而读不到了。
+    """
+    page.load(_plan())
+    text = page.warning_text()
+
+    assert "若那些目录也要迁移" not in text, "这句话诱导用户做一次没有意义的映射"
+    assert "不再存在" in text or "保持原样" in text
 
 
 def test_skip_reparse_checkbox_roundtrip(page):
@@ -393,3 +476,56 @@ def test_set_options_tolerates_old_sessions(page):
     assert page.mappings() == {}
     assert page.deep_verify() is False
     assert page.skip_unknown_reparse() is False
+
+
+# --- 归属表为空时必须说清楚，而不是留一张空表配一个可点的按钮 -----------
+
+def test_empty_group_table_says_there_is_nothing_to_map(page):
+    """没有指向树外的链接时，要明说「没有链接可映射」并把按钮置灰。
+
+    真实案例：用户把 Windows 快捷方式（.lnk）当成了目录软链接，
+    扫描出链接数 0、归属表空，然后反复点「应用映射并重新扫描」——
+    什么都不会发生，因为本来就没有链接可映射。界面必须把这件事说出来，
+    否则用户只会以为按钮坏了。
+    """
+    page.load(_plan(link_groups=[], links=[]))
+
+    assert page.group_table.rowCount() == 0
+    assert "没有" in page.group_hint_text(), "空表必须给出说明"
+    assert page.apply_button.isEnabled() is False, "没有链接可映射时按钮应当置灰"
+    # 表格必须整块收起来：留在那里会把卡片高度占满，说明文字被挤到
+    # 可视区外——渲染实测过，用户根本看不到那行说明。
+    assert page.group_table.isHidden() is True
+
+
+def test_groups_present_hides_the_hint_and_enables_apply(page):
+    page.load(_plan())
+
+    assert page.group_table.rowCount() == 1
+    assert page.group_hint_text() == "", "有分组时不该显示空表说明"
+    assert page.group_table.isHidden() is False, "有分组时表格必须显示"
+    assert page.apply_button.isEnabled() is True
+
+
+def test_mapping_summary_reports_groups_and_links():
+    """重扫只要 0.03 秒，状态栏回到「计划已生成」和点击前一模一样。
+
+    所以必须给一句话说明「到底应用了什么、影响多少条链接」。
+    """
+    plan = _plan()
+    plan.link_groups = [
+        TargetGroup(prefix=NPM_CACHE, count=482, mapped_to=r"E:\npm-cache"),
+        TargetGroup(prefix=r"D:\other", count=18, mapped_to=""),
+    ]
+    assert mapping_summary(plan, {NPM_CACHE: r"E:\npm-cache"}) == \
+        "映射已应用：1 组、共 482 条链接的指向将被重写"
+
+
+def test_mapping_summary_without_mappings():
+    assert "未设置" in mapping_summary(_plan(), {})
+
+
+def test_mapping_summary_when_nothing_matched():
+    """映射还在、但没有任何分组对上（比如那些行在重扫后消失了）。"""
+    text = mapping_summary(_plan(), {r"D:\gone": r"E:\x"})
+    assert "没有匹配" in text

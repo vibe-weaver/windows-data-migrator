@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QBrush
 from PySide6.QtWidgets import (QHBoxLayout, QHeaderView, QListWidgetItem,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
@@ -20,10 +21,61 @@ import qfluentwidgets as qf
 from ..core.models import MigrationPlan, lossy_attribute_text
 from . import chrome
 from .format import estimate_seconds, human_bytes, human_duration
-from .theme import MUTED
+from .theme import ACCENT_PAIR, MUTED, WARNING
 
-GROUP_HEADERS = ["链接目标目录", "链接数", "重写为"]
+GROUP_HEADERS = ["链接目标目录", "链接数", "重写为", "迁移后指向"]
+MAPPING_COLUMN = 2          # 用户可编辑的那一列
+DERIVED_COLUMN = 3          # 只读：应用映射后链接实际会指向哪里
 LOCK_HINT = "执行时检测"
+MAPPING_PLACEHOLDER = "留空 = 保持原样"
+
+# 非链接类重解析点卡片的说明。这类东西对用户完全陌生：既不是链接，也不是普通
+# 文件/目录；而且不勾会触发云端下载、勾了又可能造成不可逆的丢失，必须讲清楚。
+UNKNOWN_REPARSE_CAPTION = (
+    "这类条目不是链接，也不是普通文件或目录：云占位符（OneDrive 按需文件，"
+    "本地只有一个指针、内容在云端）、AppExecLink（应用商店应用的执行别名）、"
+    "Dedup（服务器去重卷）等。它们背后都有真实数据，所以默认按真实内容复制——"
+    "能直读的读出内容（云占位符会触发下载，可能很慢、很占流量），"
+    "读不动的把重解析数据原样搬过去。\n"
+    "勾选后这些条目完全不复制，只留在备份里；源目录删除后备份就是唯一副本，"
+    "而备份通常也会跟着被删。请先确认它们确实不再需要。")
+
+# 归属表上方的说明。必须讲清**什么条件才该填**：工具只改链接指向，不替用户搬运
+# 那个目录；而「旧路径还在」时根本不需要填。真实案例：用户把链接映射到一个空目录，
+# 结果经原路径再也读不到数据——原说明只讲了「怎么操作」，没讲「什么情况下才该填」；
+# 而早期那句「已经把该目录搬到别处时才填」也不准：迁移成链接之后原路径照常可用，
+# 链接会自己穿过那一层，留空就够了。
+GROUP_CAPTION = ("「重写为」留空 = 保持原样，多数情况都该留空。只有那个目录原来的"
+                 "位置以后不再存在时才需要填（比如你把它剪切走了、原目录已删）；"
+                 "如果它只是被迁移成了链接、原路径仍然可用，留空就够了——"
+                 "链接会自己穿过那一层。工具只改链接指向，不会替你搬运目录；"
+                 "填一个还没有数据的路径会让链接指空。"
+                 "右列「迁移后指向」实时显示结果。")
+
+# 归属表为空时的说明。真实案例：用户把 Windows 快捷方式（.lnk）当成了
+# 目录软链接，扫描出链接数 0、归属表空，然后反复点「应用映射并重新扫描」——
+# 什么都不会发生。界面必须说清「这里本来就没有链接可映射」，
+# 否则用户只会以为按钮坏了。
+NO_GROUP_HINT = ("源目录里没有指向树外（源树之外）的链接，无需映射。"
+                 "注意 Windows 快捷方式（.lnk）不是链接，会被当作普通文件复制。")
+
+
+def mapping_summary(plan, mappings) -> str:
+    """重扫结束后给用户的一句话结论。
+
+    实测：重扫只要 0.03 秒，状态栏从「正在扫描…」闪回「计划已生成」——
+    和点击前一模一样，而表格里「重写为」那格本来就是你填的内容。
+    不额外说明「应用了什么、影响多少条链接」，用户看到的就是「点了没反应」。
+    """
+    if not mappings:
+        return "已重新扫描（未设置任何映射）"
+    applied = [g for g in (getattr(plan, "link_groups", None) or [])
+               if getattr(g, "mapped_to", "")]
+    if not applied:
+        return (f"已重新扫描：{len(mappings)} 条映射没有匹配到任何链接，"
+                f"链接指向未改变")
+    links = sum(int(getattr(g, "count", 0) or 0) for g in applied)
+    return f"映射已应用：{len(applied)} 组、共 {links:,} 条链接的指向将被重写"
 
 # (键, 面板上的中文标题)，顺序即展示顺序
 METRICS: tuple[tuple[str, str], ...] = (
@@ -42,18 +94,18 @@ METRICS: tuple[tuple[str, str], ...] = (
 METRIC_LABELS: dict[str, str] = dict(METRICS)
 
 # 「重写为」列固定宽度：链接目标目录通常很长，这一列要给用户足够的手填空间。
-# 取 240 会让整表超出视口、底部长出横向滚动条，240 的右半截本来就是空的，
-# 因此收到 180：手填路径仍然够用，同时消灭横向滚动条。
 MAPPING_COLUMN_WIDTH = 180
 
 
-def _card(title: str) -> tuple[chrome.Card, QVBoxLayout]:
-    """带标题的卡片。"""
+def _card(title: str, icon_name: str = "") -> tuple[chrome.Card, QVBoxLayout]:
+    """带图标标题的卡片。"""
     card = chrome.Card()
     box = QVBoxLayout(card)
-    box.setContentsMargins(16, 12, 16, 16)
-    box.setSpacing(8)
-    box.addWidget(qf.StrongBodyLabel(title))
+    box.setContentsMargins(20, 14, 20, 16)
+    box.setSpacing(10)
+    icon = chrome.fluent_icon(icon_name) if icon_name else None
+    header = chrome.make_section_header(title, icon)
+    box.addWidget(header)
     return card, box
 
 
@@ -87,34 +139,70 @@ class PlanPage(QWidget):
         # 所以这里必须传中文显示名；英文键另用 metric_labels 维护，
         # 否则界面上会显示成 "bytes" / "files" 而不是「真实数据量」/「文件数」。
         self.metric_row = chrome.MetricRow([(label, "-") for _, label in METRICS])
-        self.metric_labels: dict[str, qf.TitleLabel] = {}
-        for box_index, (key, _label) in enumerate(METRICS):
-            box = self.metric_row.layout().itemAt(box_index).layout()
-            # layout 里的子项被接管后就是 MetricRow 的子控件，parent 有了，可见性随父
-            self.metric_labels[key] = box.itemAt(0).widget()
-        metrics_card, metrics_layout = _card("迁移计划")
+        self.metric_labels: dict[str, qf.BodyLabel] = {}
+        for key, _label in METRICS:
+            self.metric_labels[key] = self.metric_row.value_widget(METRIC_LABELS[key])
+        metrics_card, metrics_layout = _card("迁移计划", "LIBRARY")
         metrics_layout.addWidget(self.metric_row)
 
-        # 摘要信息：默认用库的正文色，不做人为着色，深浅色下都清晰
-        self.warn_label = qf.BodyLabel("")
-        self.warn_label.setWordWrap(True)
-        self.warn_label.setTextColor(*MUTED)
-        warn_card, warn_layout = _card("计划摘要")
-        warn_layout.addWidget(self.warn_label)
+        # 摘要信息：源 / 目标 / 目标盘剩余做成「标签在上、值在下」的三列，
+        # 提示条目逐条一行（圆点 + 文字），不再挤成一整块密不透风的文字。
+        self._info_values: dict[str, qf.BodyLabel] = {}
+        info_grid = QHBoxLayout()
+        info_grid.setContentsMargins(0, 0, 0, 0)
+        info_grid.setSpacing(16)
+        for i, (title, key) in enumerate((("源", "source"),
+                                          ("目标", "target"),
+                                          ("目标盘剩余", "free"))):
+            box = QVBoxLayout()
+            box.setContentsMargins(0, 0, 0, 0)
+            box.setSpacing(2)
+            cap = qf.CaptionLabel(title)
+            cap.setTextColor(*MUTED)
+            val = qf.BodyLabel("-")
+            val.setToolTip("")
+            box.addWidget(cap)
+            box.addWidget(val)
+            info_grid.addLayout(box, 1)
+            self._info_values[key] = val
+            if i < 2:
+                info_grid.addWidget(chrome.Rule(Qt.Orientation.Vertical))
+        self._info_grid_layout = info_grid
+
+        # 提示条目容器：load() 时重建
+        self._hints: list[QWidget] = []
+        self._hint_layout = QVBoxLayout()
+        self._hint_layout.setContentsMargins(0, 0, 0, 0)
+        self._hint_layout.setSpacing(7)
+        # warning_text() 的数据源：摘要各行文本按展示顺序拼接
+        self._summary_texts: list[str] = []
+
+        warn_card, warn_layout = _card("计划摘要", "INFO")
+        warn_layout.addLayout(info_grid)
+        warn_layout.addWidget(chrome.Rule(Qt.Orientation.Horizontal))
+        warn_layout.addLayout(self._hint_layout)
 
         self.group_table = qf.TableWidget()
         # qf.TableWidget() 不接受行列数，必须显式设置
         self.group_table.setColumnCount(len(GROUP_HEADERS))
         self.group_table.setRowCount(0)
         self.group_table.setHorizontalHeaderLabels(GROUP_HEADERS)
+        # 只读表——但「重写为」那一列是 setCellWidget 放进去的输入框，**不受影响**
+        # （格子控件自己处理事件，不走表的编辑触发器）。而 qf.TableWidget 默认带
+        # AnyKeyPressed：不在格子里、敲任意键进编辑态，格子会变成带清空按钮的
+        # 输入框，看着像坏了。
+        self.group_table.setEditTriggers(
+            qf.TableWidget.EditTrigger.NoEditTriggers)
         # 列宽必须显式分配：默认 100px 会把「链接目标目录」这条最长、
         # 也最关键的信息截成 "C:..."，用户根本看不出链接指向哪个仓库。
         header = self.group_table.horizontalHeader()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.group_table.setColumnWidth(2, MAPPING_COLUMN_WIDTH)
+        header.setSectionResizeMode(MAPPING_COLUMN, QHeaderView.ResizeMode.Fixed)
+        self.group_table.setColumnWidth(MAPPING_COLUMN, MAPPING_COLUMN_WIDTH)
+        header.setSectionResizeMode(DERIVED_COLUMN, QHeaderView.ResizeMode.Stretch)
+        self.group_table.verticalHeader().setDefaultSectionSize(36)
 
         self.unknown_list = qf.ListWidget()
         # 未知重解析点通常为空或个位数；不给它无限高度，
@@ -130,41 +218,59 @@ class PlanPage(QWidget):
         self.skip_denied_check = qf.CheckBox(
             "跳过无权限访问的目录（它们只保留在备份里，删备份前请确认不再需要）")
         self.apply_button = qf.PrimaryPushButton("应用映射并重新扫描")
+        self.apply_button.setMinimumWidth(196)
+        self.apply_button.setMinimumHeight(34)
         self.elevate_button = qf.PushButton("以管理员身份重试")
         self.elevate_button.setEnabled(False)
         self.takeover_button = qf.PushButton("接管这些目录的权限")
         self.takeover_button.setEnabled(False)
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(10)
         buttons.addWidget(self.apply_button)
         buttons.addWidget(self.elevate_button)
         buttons.addWidget(self.takeover_button)
         buttons.addStretch(1)
 
         unknown_card, unknown_layout = _card(
-            "非链接类重解析点（云占位符 / AppExecLink / Dedup 等，默认按真实内容复制）")
+            "非链接类重解析点（云占位符 / AppExecLink / Dedup 等，默认按真实内容复制）",
+            "HELP")
+        self.unknown_caption = qf.CaptionLabel(UNKNOWN_REPARSE_CAPTION)
+        self.unknown_caption.setWordWrap(True)
+        unknown_layout.addWidget(self.unknown_caption)
         unknown_layout.addWidget(self.skip_reparse_check)
         unknown_layout.addWidget(self.unknown_list)
 
-        groups_card, groups_layout = _card("链接目标归属表")
-        groups_layout.addWidget(qf.CaptionLabel(
-            "「重写为」留空表示保持原样；填写新路径后点「应用映射并重新扫描」，"
-            "指向该目录的链接会全部改指到新位置。"))
+        groups_card, groups_layout = _card("链接目标归属表", "LINK")
+        # 留一个引用：说明文字要能读出来（测试与调试），也便于以后统一改文案
+        self.group_caption = qf.CaptionLabel(GROUP_CAPTION)
+        self.group_caption.setWordWrap(True)
+        groups_layout.addWidget(self.group_caption)
         groups_layout.addWidget(self.group_table)
+        # 空表说明：没有链接可映射时必须说出来，否则「点了没反应」
+        self.group_hint = qf.CaptionLabel("")
+        self.group_hint.setTextColor(*MUTED)
+        self.group_hint.setWordWrap(True)
+        self.group_hint.hide()
+        groups_layout.addWidget(self.group_hint)
+
+        options_card, options_layout = _card("复制选项", "SETTING")
+        options_layout.addWidget(self.deep_check)
+        options_layout.addWidget(self.skip_denied_check)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 20, 28, 20)
+        layout.setSpacing(14)
         layout.addWidget(metrics_card)
         layout.addWidget(warn_card)
         layout.addWidget(groups_card, 1)
         layout.addWidget(unknown_card)
-        layout.addWidget(self.skip_denied_check)
-        layout.addWidget(self.deep_check)
+        layout.addWidget(options_card)
         layout.addLayout(buttons)
 
         self.apply_button.clicked.connect(self.replan_requested.emit)
         self.elevate_button.clicked.connect(self.elevate_requested.emit)
         self.takeover_button.clicked.connect(self.takeover_requested.emit)
-        self.group_table.itemChanged.connect(self._on_group_item_changed)
         # 跳过与否会改变真实数据量与复制行为，必须重扫，
         # 否则页面显示的计划与实际执行的不一致。
         self.skip_reparse_check.toggled.connect(self._on_skip_toggled)
@@ -213,60 +319,74 @@ class PlanPage(QWidget):
         ):
             self.metric_row.set_value(METRIC_LABELS[key], value)
 
-        lines = [f"源：{plan.source}",
-                 f"目标：{plan.target}",
-                 f"目标盘剩余：{human_bytes(plan.free_bytes)}"]
+        self._info_values["source"].setText(str(plan.source))
+        self._info_values["target"].setText(str(plan.target))
+        self._info_values["free"].setText(human_bytes(plan.free_bytes))
+        summary: list[tuple[str, bool]] = []     # (文本, 是否警示)
         if plan.link_groups:
             outside = sum(group.count for group in plan.link_groups)
-            lines.append(f"{outside} 个链接指向源树之外；若那些目录也要迁移，"
-                         "请在下方为每个目标目录填写重写后的新路径。")
+            summary.append(
+                (f"{outside} 个链接指向源树之外；默认保持原样，原路径照常可用。"
+                 "只有那些目录原来的位置以后不再存在时，才需要在下方填写新路径。",
+                 False))
         dangling = [link for link in plan.links if link.is_dangling]
         if dangling:
             shown = "、".join(link.rel for link in dangling[:3])
             if len(dangling) > 3:
                 shown += "…"
-            lines.append(f"{len(dangling)} 条链接的目标现在就不存在（断链）：{shown}。"
-                         "仍会原样重建，迁移后照样指不到东西。")
+            summary.append(
+                (f"{len(dangling)} 条链接的目标现在就不存在（断链）：{shown}。"
+                 "仍会原样重建，迁移后照样指不到东西。", True))
         lossy = lossy_attribute_text(plan.sparse_files, plan.hardlinked_files,
                                      plan.ads_files)
         if lossy:
-            lines.append(f"复制方式的固有限制：{lossy}。")
+            summary.append((f"复制方式的固有限制：{lossy}。", False))
         if plan.permission_issues:
             if already_elevated:
-                lines.append(f"{len(plan.permission_issues)} 个目录即使提权也访问不了，"
-                             "请检查这些路径是否存在或已被占用；"
-                             "确实拿不到权限的，勾选下方「跳过无权限访问的目录」把它们排除掉。")
+                summary.append(
+                    (f"{len(plan.permission_issues)} 个目录即使提权也访问不了，"
+                     "请检查这些路径是否存在或已被占用；"
+                     "确实拿不到权限的，勾选下方「跳过无权限访问的目录」把它们排除掉。",
+                     True))
             else:
-                lines.append(f"{len(plan.permission_issues)} 个目录无权限访问，"
-                             "请点「以管理员身份重试」；"
-                             "确实拿不到权限的，勾选下方「跳过无权限访问的目录」把它们排除掉。")
+                summary.append(
+                    (f"{len(plan.permission_issues)} 个目录无权限访问，"
+                     "请点「以管理员身份重试」；"
+                     "确实拿不到权限的，勾选下方「跳过无权限访问的目录」把它们排除掉。",
+                     True))
         if plan.excluded:
             shown = "、".join(plan.excluded[:3])
             if len(plan.excluded) > 3:
                 shown += "…"
-            lines.append(f"已跳过 {len(plan.excluded)} 项（{shown}）："
-                         "它们不会复制到目标，只存在于备份里。")
+            summary.append(
+                (f"已跳过 {len(plan.excluded)} 项（{shown}）："
+                 "它们不会复制到目标，只存在于备份里。", False))
         self._symlink_blocked = bool(plan.file_symlinks) and not symlink_capable
         if self._symlink_blocked:
             if already_elevated:
-                lines.append(f"{plan.file_symlinks} 个文件符号链接即使提权也建不起来，"
-                             "请开启 Windows 开发者模式，或检查组策略里"
-                             "「创建符号链接」权限有没有授予当前用户。")
+                summary.append(
+                    (f"{plan.file_symlinks} 个文件符号链接即使提权也建不起来，"
+                     "请开启 Windows 开发者模式，或检查组策略里"
+                     "「创建符号链接」权限有没有授予当前用户。", True))
             else:
-                lines.append(f"{plan.file_symlinks} 个文件符号链接需要管理员特权才能重建"
-                             "（目录链接会降级为 junction，不受影响）。"
-                             "现在不处理，等到复制完才会失败——请点「以管理员身份重试」，"
-                             "或开启 Windows 开发者模式。")
+                summary.append(
+                    (f"{plan.file_symlinks} 个文件符号链接需要管理员特权才能重建"
+                     "（目录链接会降级为 junction，不受影响）。"
+                     "现在不处理，等到复制完才会失败——请点「以管理员身份重试」，"
+                     "或开启 Windows 开发者模式。", True))
         if plan.unknown_reparse:
             if plan.skip_unknown_reparse:
-                lines.append(f"{len(plan.unknown_reparse)} 个非链接类重解析点将被跳过，"
-                             "它们只存在于备份中——删除备份前请确认不再需要。")
+                summary.append(
+                    (f"{len(plan.unknown_reparse)} 个非链接类重解析点将被跳过，"
+                     "它们只存在于备份中——删除备份前请确认不再需要。", False))
             else:
-                lines.append(f"{len(plan.unknown_reparse)} 个非链接类重解析点将按真实内容"
-                             "复制（云占位符会触发下载，可能很慢）。")
+                summary.append(
+                    (f"{len(plan.unknown_reparse)} 个非链接类重解析点将按真实内容"
+                     "复制（云占位符会触发下载，可能很慢）。", False))
         if plan.target_not_empty:
-            lines.append("提示：目标目录已存在且非空，将按续传/合并处理。")
-        self.warn_label.setText("\n".join(lines))
+            summary.append(("提示：目标目录已存在且非空，将按续传/合并处理。",
+                            False))
+        self._render_summary(summary)
 
         self._loading = True
         try:
@@ -283,12 +403,40 @@ class PlanPage(QWidget):
                 count_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 count_item.setToolTip(str(group.count))
                 self.group_table.setItem(row, 1, count_item)
+
                 # 计划回传的 mapped_to 优先；计划里没有就用页面自己记住的，
                 # 否则用户填一次、重扫一次就被清空，映射随之丢失。
                 mapped = group.mapped_to or self._mappings.get(group.prefix, "")
-                mapping_item = QTableWidgetItem(mapped)
-                mapping_item.setToolTip(mapped)
-                self.group_table.setItem(row, 2, mapping_item)
+                # 用**真正的输入框**而不是普通单元格：单元格没有任何视觉提示，
+                # 第一次用的人根本不知道那里能填（真实反馈：「不仔细看根本看不到」）。
+                editor = qf.LineEdit()
+                editor.setPlaceholderText(MAPPING_PLACEHOLDER)
+                editor.setText(mapped)
+                editor.setToolTip(mapped)
+                editor.textChanged.connect(
+                    lambda text, r=row: self._on_mapping_edited(r, text))
+                self.group_table.setCellWidget(row, MAPPING_COLUMN, editor)
+
+                derived = QTableWidgetItem("")
+                derived.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self.group_table.setItem(row, DERIVED_COLUMN, derived)
+
+            self._refresh_derived_targets()
+
+            # 没有分组 = 没有链接可映射。空表配一个可点的按钮会让人以为按钮坏了，
+            # 所以明说一句，并把按钮置灰。
+            # 表格**整块隐藏**而不是留在那里配一行说明：表格会把卡片高度占满，
+            # 说明文字被挤到可视区外，用户根本看不到（渲染实测过）。
+            # 注意：勾选「跳过重解析点」是直接发信号触发重扫的，不走这个按钮，
+            # 所以置灰不会挡住那条路径。
+            has_groups = self.group_table.rowCount() > 0
+            self.apply_button.setEnabled(has_groups)
+            self.group_table.setVisible(has_groups)
+            if has_groups:
+                self.group_hint.hide()
+            else:
+                self.group_hint.setText(NO_GROUP_HINT)
+                self.group_hint.show()
             # setChecked 会触发 toggled，必须在 _loading 保护区间内回显，
             # 否则每次 load() 都会多请求一次重扫。
             self.skip_reparse_check.setChecked(plan.skip_unknown_reparse)
@@ -341,14 +489,14 @@ class PlanPage(QWidget):
         listed: set[str] = set()
         for row in range(self.group_table.rowCount()):
             source_item = self.group_table.item(row, 0)
-            target_item = self.group_table.item(row, 2)
-            if source_item is None or target_item is None:
+            editor = self.mapping_editor(row)
+            if source_item is None or editor is None:
                 continue
             source = source_item.text().strip()
             if not source:
                 continue
             listed.add(source)
-            target = target_item.text().strip()
+            target = editor.text().strip()
             if not target:
                 continue
             if os.path.normcase(os.path.normpath(target)) == \
@@ -378,13 +526,53 @@ class PlanPage(QWidget):
         else:
             self._mappings[prefix] = value
 
-    def _on_group_item_changed(self, item) -> None:
-        """用户直接在「重写为」单元格里打字时也要记住，否则重扫后照样丢。"""
-        if self._loading or item.column() != 2:
+    def mapping_editor(self, row: int) -> "qf.LineEdit | None":
+        """某一行的「重写为」输入框。"""
+        return self.group_table.cellWidget(row, MAPPING_COLUMN)
+
+    def derived_target_text(self, row: int) -> str:
+        """某一行的「迁移后指向」——应用当前映射后，链接实际会指向哪里。"""
+        item = self.group_table.item(row, DERIVED_COLUMN)
+        return item.text() if item is not None else ""
+
+    def group_caption_text(self) -> str:
+        """归属表上方的说明文字（讲清前提，避免误用）。"""
+        return self.group_caption.text()
+
+    def unknown_caption_text(self) -> str:
+        """非链接类重解析点卡片上的说明文字。"""
+        return self.unknown_caption.text()
+
+    def _on_mapping_edited(self, row: int, text: str) -> None:
+        """用户在输入框里打字时记住它，否则重扫后照样丢。"""
+        if self._loading:
             return
-        prefix_item = self.group_table.item(item.row(), 0)
+        prefix_item = self.group_table.item(row, 0)
         if prefix_item is not None:
-            self._remember_mapping(prefix_item.text().strip(), item.text().strip())
+            self._remember_mapping(prefix_item.text().strip(), text.strip())
+        self._refresh_derived_targets()
+
+    def _refresh_derived_targets(self) -> None:
+        """把「迁移后指向」重算一遍。
+
+        这是「点应用看不出变化」的根治：左边那列是分组前缀（原始指向）永远不变，
+        「重写为」显示的是用户自己填的字也不变，所以原来点完按钮表格毫无动静。
+        把结果单独摆一列，填完立刻能看见。
+        """
+        effective = self.mappings()
+        for row in range(self.group_table.rowCount()):
+            prefix_item = self.group_table.item(row, 0)
+            item = self.group_table.item(row, DERIVED_COLUMN)
+            if prefix_item is None or item is None:
+                continue
+            prefix = prefix_item.text().strip()
+            target = effective.get(prefix) or prefix
+            item.setText(target)
+            item.setToolTip(target)
+            # 映射没生效时用普通色，生效了才用强调色——一眼看出哪几行会变
+            changed = bool(effective.get(prefix))
+            item.setForeground(QBrush(chrome.pick_color(
+                ACCENT_PAIR if changed else MUTED)))
 
     def _on_skip_toggled(self, _checked: bool) -> None:
         if self._loading:
@@ -409,22 +597,25 @@ class PlanPage(QWidget):
         return self.skip_reparse_check.isChecked()
 
     def group_rows(self) -> list[tuple[str, int, str]]:
+        """(链接目标目录, 链接数, 重写为) —— 对外接口，实现随控件形态变化。"""
         rows: list[tuple[str, int, str]] = []
         for row in range(self.group_table.rowCount()):
+            editor = self.mapping_editor(row)
             rows.append((self.group_table.item(row, 0).text(),
                          int(self.group_table.item(row, 1).text()),
-                         self.group_table.item(row, 2).text()))
+                         editor.text() if editor is not None else ""))
         return rows
 
     def set_mapping(self, row: int, mapped_to: str) -> None:
-        item = self.group_table.item(row, 2)
-        if item is not None:
-            item.setText(mapped_to)
+        editor = self.mapping_editor(row)
+        if editor is not None:
+            editor.setText(mapped_to)
             # tooltip 同步，否则改完映射后悬停看到的还是旧值
-            item.setToolTip(mapped_to)
+            editor.setToolTip(mapped_to)
         prefix_item = self.group_table.item(row, 0)
         if prefix_item is not None:
             self._remember_mapping(prefix_item.text().strip(), mapped_to.strip())
+            self._refresh_derived_targets()
 
     def metric_text(self, key: str) -> str:
         """读取某个指标的文本。
@@ -436,11 +627,61 @@ class PlanPage(QWidget):
         """
         return self.metric_labels[key].text()
 
+    def _render_summary(self, entries: list[tuple[str, bool]]) -> None:
+        """重建提示条目区：每条一行（圆点 + 文字），警示条目用警示色圆点。
+
+        旧实现把所有条目 setText 进同一个 label，换行后就是一整块密不透风
+        的文字，条目之间没有呼吸感；逐条排版后扫读顺序清晰。
+        `_summary_texts` 首部永远带上信息三行，`warning_text()` 的读法
+        与旧版一致。
+        """
+        # 清空旧条目：widget 用 deleteLater，layout 里残留的空位也移除
+        while self._hint_layout.count():
+            item = self._hint_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._hints.clear()
+
+        info = [f"源：{self._info_values['source'].text()}",
+                f"目标：{self._info_values['target'].text()}",
+                f"目标盘剩余：{self._info_values['free'].text()}"]
+        texts = info + [text for text, _warn in entries]
+        for text, warn in entries:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(8)
+            dot = qf.CaptionLabel("●")
+            dot.setStyleSheet("font-size: 7px;")
+            dot.setTextColor(*(WARNING if warn else ACCENT_PAIR))
+            dot.setFixedWidth(14)
+            dot.setAlignment(Qt.AlignmentFlag.AlignVCenter |
+                             Qt.AlignmentFlag.AlignHCenter)
+            label = qf.BodyLabel(text)
+            label.setWordWrap(True)
+            row_layout.addWidget(dot, 0, Qt.AlignmentFlag.AlignVCenter)
+            row_layout.addWidget(label, 1)
+            self._hint_layout.addWidget(row)
+            self._hints.append(row)
+        self._summary_texts = texts
+
     def warning_text(self) -> str:
-        return self.warn_label.text()
+        """摘要全文（信息三行 + 提示条目），供测试与调试读取。"""
+        return "\n".join(self._summary_texts)
+
+    def group_hint_text(self) -> str:
+        """归属表为空时的说明文字；有分组时返回空串。
+
+        用 `isHidden()` 而不是 `isVisible()`：前者只反映显式的 hide/show，
+        与父窗口有没有显示无关，测试里不需要真把窗口 show 出来。
+        """
+        return "" if self.group_hint.isHidden() else self.group_hint.text()
 
     def deep_verify(self) -> bool:
         return self.deep_check.isChecked()
 
     def unknown_count(self) -> int:
         return self.unknown_list.count()
+
+

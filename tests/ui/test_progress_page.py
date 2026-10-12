@@ -134,3 +134,107 @@ def test_fatal_reasons_have_readable_text(page):
     page.add_failure(CopyFailure(rel="link", reason="symlink_privilege"))
     assert page.failure_rows() == [("big.bin", "目标卷空间不足", ""),
                                    ("link", "缺符号链接特权", "")]
+
+
+# --- 完成后能拿到完整日志文件 -----------------------------------------
+
+def _outcome(log_path="", ok=True, phase="done", message="", backup_path=""):
+    from dmig.core.migrator import MigrateOutcome
+    return MigrateOutcome(ok, phase, log_path=log_path, message=message,
+                          backup_path=backup_path or None)
+
+
+def test_finish_warns_about_deleting_the_backup_by_hand(page):
+    """迁移刚成功那一刻就该看到警告。
+
+    用户往往正是这会儿去资源管理器里把备份目录删掉（"数据都迁好了，这个没用了吧"）。
+    等他在报告页点「一键回滚」被拒才第一次听说后果，已经晚了。
+    """
+    outcome = _outcome(ok=True, phase="done", backup_path=r"C:\wwwwww.bak_1")
+    page.finish(outcome, 1.0)
+
+    text = page.backup_warning_text()
+    assert "请勿在不确定的情况下删除备份" in text
+    assert r"C:\wwwwww.bak_1" in text
+    assert "回滚必须依靠备份" in text
+    assert "删除备份后将无法再进行回滚" in text
+
+
+def test_finish_has_no_backup_warning_without_a_backup(page):
+    page.finish(_outcome(ok=True, phase="done"), 1.0)
+    assert page.backup_warning_text() == ""
+
+
+def test_second_run_does_not_keep_the_previous_backup_warning(page):
+    """第二趟开始后，上一趟的「请勿删除备份」必须消失。
+
+    否则用户在第二趟跑到一半时看到「请勿删除备份：C:\\上一趟的备份」，
+    会以为那才是这次要留意的备份——警告指向一个已经过期的对象比没有更糟。
+    """
+    page.finish(_outcome(ok=True, phase="done", backup_path=r"C:\a.bak_1"), 1.0)
+    assert page.backup_warning_text() != ""
+
+    page.reset()
+    page.update_progress(Progress(phase="copying", done_files=1, total_files=10))
+
+    assert page.backup_warning_text() == ""
+
+
+def test_finish_title_uses_a_short_readable_label(page):
+    """完成横幅的大标题不能塞整段报错，也不能露内部键名。
+
+    原来取的是 outcome.message——那是一整段带 \\?\ 长路径的异常原文；
+    退而取 outcome.phase 又是 rename_failed 这种键名。大标题只该说清
+    「卡在哪一步」，细节留给下面的说明行。
+    """
+    outcome = _outcome(ok=False, phase="rename_failed",
+                       message="[WinError 5] 拒绝访问。: "
+                               "'\\\\?\\C:\\a' -> '\\\\?\\C:\\b'；正在占用源目录的进程："
+                               "WPS PDF (29396)。关掉它们后重试即可")
+    page.finish(outcome, 1.0)
+
+    assert page.finish_title.text() == "未完成：源目录改名失败"
+
+
+def test_finish_detail_still_carries_the_full_reason(page):
+    """大标题精简了，完整原因必须在说明行里找得到——不能两头都丢。"""
+    outcome = _outcome(ok=False, phase="rename_failed",
+                       message="正在占用源目录的进程：WPS PDF (29396)")
+    page.finish(outcome, 1.0)
+    assert "WPS PDF" in page.finish_detail.text()
+
+
+def test_open_log_button_is_hidden_without_a_log_file(page):
+    page.finish(_outcome(), 1.0)
+    assert page.open_log_button.isVisible() is False
+
+def test_open_log_button_appears_when_there_is_a_log(page, tmp_path):
+    """界面面板为防刷屏只显示前若干条失败，完整日志还得能打开。"""
+    log = tmp_path / "run.log"
+    log.write_text("x", encoding="utf-8")
+    page.finish(_outcome(str(log)), 1.0)
+    assert page.open_log_button.isVisibleTo(page) is True
+
+
+def test_opening_a_vanished_log_says_so_instead_of_crashing(page, tmp_path):
+    """日志可能已经被清理掉；这时要说清楚，而不是点了没反应。"""
+    page.finish(_outcome(str(tmp_path / "已经没了.log")), 1.0)
+    page.open_log_button.click()
+    assert "不存在" in page.log.toPlainText()
+
+
+def test_open_log_launches_explorer_with_the_file_selected(page, tmp_path,
+                                                           monkeypatch):
+    import dmig.ui.progress_page as module
+
+    log = tmp_path / "run.log"
+    log.write_text("x", encoding="utf-8")
+    launched = []
+    monkeypatch.setattr(module.subprocess, "Popen", launched.append)
+
+    page.finish(_outcome(str(log)), 1.0)
+    page.open_log_button.click()
+
+    assert launched, "应当拉起资源管理器"
+    # explorer 的 /select 要求路径和开关拼在同一个参数里，否则含空格的路径会被拆开
+    assert launched[0] == ["explorer", f"/select,{log}"]
