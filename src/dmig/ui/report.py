@@ -14,6 +14,7 @@ REASON_TEXT = {
     "io_error": "读写错误",
     "disk_full": "目标卷空间不足",
     "symlink_privilege": "创建符号链接需要管理员特权",
+    "link_target_excluded": "链接指向的目录已被排除，跳过重建",
 }
 
 KIND_COPY_FAILED = "未复制"
@@ -24,6 +25,70 @@ KIND_REWRITTEN = "链接重写"
 KIND_DIR_TIME = "目录时间戳"
 KIND_ATTRS = "未保留属性"
 KIND_EXCLUDED = "已跳过"
+KIND_BLOCKED = "未完成步骤"
+KIND_RESTORED = "恢复"
+
+# 恢复态里「目标端」那一行的文案。放在这个纯文本模块里，界面与导出共用一份，
+# 免得两处各写一套、慢慢分叉。
+TARGET_STATE_TEXT = {
+    "cleared": "已清空（目录本身保留）",
+    "kept": "保留未清（没有勾选「同时删除目标端内容」）",
+    "skipped": "未清理",
+    "missing": "本就不存在，无需清理",
+    "failed": "没能清干净",
+}
+
+# 阶段键 → 给用户看的短标签。原来直接把内部键名甩进标题：报告页顶着 60pt 的红字
+# 「未完成：rename_failed」（真实反馈）。键名是给代码看的，不是给人看的。
+PHASE_TEXT = {
+    "rename_failed": "源目录改名失败",
+    "verify_failed": "校验未通过",
+    "verify_cancelled": "校验被取消",
+    "link_failed": "源目录链接创建失败",
+    "link_verify_failed": "链接已建但无法访问",
+    "privilege_required": "需要管理员权限",
+    "aborted": "已中止",
+    "done": "已完成",
+}
+
+
+def phase_text(phase) -> str:
+    """阶段键的用户可读说法。没收录的原样返回——宁可露出生词，也别把信息吞掉。"""
+    return PHASE_TEXT.get(phase or "", phase or "")
+
+
+def backup_warning_text(backup_path) -> str:
+    """「别在不确定的情况下删备份」的警告正文；没有备份时返回空串。
+
+    要讲的三件事（用户两轮反馈后定下来的）：
+      1. 判据是**确定 / 不确定**，不是「手动删 / 用工具删」——
+         用本页的「删除备份」按钮删，同样失去回滚能力；
+      2. 删除备份后，将无法再进行回滚；
+      3. 根本原因：回滚必须依靠备份文件。
+
+    报告页和进度页共用这一份，免得两处措辞漂移。
+    """
+    if not backup_path:
+        return ""
+    return (f"⚠ 请勿在不确定的情况下删除备份：{backup_path}\n"
+            f"回滚必须依靠备份文件。删除备份后将无法再进行回滚——"
+            f"「一键回滚」会直接失败，源路径也就回不到迁移前的状态了。"
+            f"确认不再需要退回迁移前的状态，再用本页的「删除备份」。")
+
+
+def blocked_rows(outcome) -> list[list[str]]:
+    """整趟卡在某一步时的清单条目。
+
+    改名失败、建链失败、缺权限这类问题不属于「复制失败／缺失／断链／属性丢失」
+    任何一类，于是清单是空的——用户看到刺眼的红标题配一张空表，而问题明明就在
+    眼前（谁占着文件、要关掉什么），却什么也读不到。
+    """
+    path = getattr(outcome, "blocked_path", "") or ""
+    reason = getattr(outcome, "blocked_reason", "") or ""
+    if not path and not reason:
+        return []
+    return [[KIND_BLOCKED, path or "整个源目录", reason,
+             getattr(outcome, "blocked_process", "") or ""]]
 
 DANGLING_REASON = "链接目标不存在，已原样重建"
 DIR_TIME_REASON = "目录时间戳未能写回，该目录会显示为迁移时刻"
@@ -129,14 +194,49 @@ def attribute_rows(outcome) -> list[list[str]]:
 
 
 def unfinished_rows(outcome) -> list[list[str]]:
-    """界面表格的内容：没做完的事 + 断链 + 保不住的属性。"""
-    return failure_rows(outcome) + dangling_rows(outcome) + attribute_rows(outcome)
+    """界面表格的内容：卡住的步骤 + 没做完的事 + 断链 + 保不住的属性。"""
+    return (blocked_rows(outcome) + failure_rows(outcome)
+            + dangling_rows(outcome) + attribute_rows(outcome))
 
 
 def build_rows(outcome) -> list[list[str]]:
-    """CSV 的内容：没做完的事 + 保不住的属性 + 完整链接清单（含重写前后值）。"""
-    return ([list(CSV_HEADER)] + failure_rows(outcome) + attribute_rows(outcome)
-            + link_rows(outcome))
+    """CSV 的内容：卡住的步骤 + 没做完的事 + 保不住的属性 + 完整链接清单。
+
+    必须和 `unfinished_rows`（界面表格）保持一致：界面看得到的，
+    导出的存档里也要有，否则拿到报告的人看不出这一趟卡在哪一步。
+    """
+    return ([list(CSV_HEADER)] + blocked_rows(outcome) + failure_rows(outcome)
+            + attribute_rows(outcome) + link_rows(outcome))
+
+
+def build_restore_rows(outcome) -> list[list[str]]:
+    """恢复报告的 CSV：和界面上的「恢复结果」一一对应。
+
+    恢复态下不能导出那份迁移报告——那一页讲的事已经被撤销了。界面写着
+    「恢复成功」、导出却叫「迁移报告」，拿到文件的人会以为迁移还在生效。
+    """
+    rows = [list(CSV_HEADER)]
+    source = getattr(outcome, "source", "") or ""
+    if source:
+        state = ("已恢复为真实目录"
+                 if getattr(outcome, "source_restored", False) else "未恢复")
+        rows.append([KIND_RESTORED, source, state, ""])
+
+    backup = getattr(outcome, "backup_path", "") or ""
+    if backup:
+        rows.append([KIND_RESTORED, backup, "已改回原名", ""])
+
+    target = getattr(outcome, "target", "") or ""
+    state = TARGET_STATE_TEXT.get(getattr(outcome, "target_state", ""), "")
+    note = getattr(outcome, "target_note", "") or ""
+    detail = "；".join(part for part in (state, note) if part)
+    if target or detail:
+        rows.append([KIND_RESTORED, target or "（目标端）", detail, ""])
+
+    acl = getattr(outcome, "acl_note", "") or ""
+    rows.append([KIND_RESTORED, "（整棵源树）",
+                 acl or "权限未改动（本次没有接管过权限）", ""])
+    return rows
 
 
 def write_csv(path, rows) -> None:

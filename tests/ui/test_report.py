@@ -19,6 +19,99 @@ def _outcome(**kwargs):
     return MigrateOutcome(**defaults)
 
 
+def test_phase_keys_are_translated_for_users():
+    """内部阶段键不能直接甩给用户。
+
+    真实反馈：报告页顶着 60pt 的红字「未完成：rename_failed」，下面还挂着
+    Python 异常原文。用户既不知道发生了什么，也不知道下一步做什么。
+    """
+    assert report.phase_text("rename_failed") == "源目录改名失败"
+    assert report.phase_text("verify_failed") == "校验未通过"
+    assert report.phase_text("link_failed") == "源目录链接创建失败"
+    assert report.phase_text("privilege_required") == "需要管理员权限"
+
+
+def test_unknown_phase_is_passed_through():
+    """没收录的键原样返回：宁可露出生词，也不能把信息吞掉。"""
+    assert report.phase_text("brand_new_phase") == "brand_new_phase"
+    assert report.phase_text("") == ""
+
+
+def test_blocked_step_gets_its_own_row():
+    """整趟卡在某一步时，清单里必须有一条。
+
+    改名失败不属于「复制失败／缺失／断链／属性丢失」任何一类，于是清单是空的
+    ——用户看到刺眼的红标题配一张空表，而问题明明就在眼前（谁占着文件）。
+    """
+    outcome = _outcome(ok=False, phase="rename_failed",
+                       blocked_path=r"C:\wwwwwww",
+                       blocked_reason="拒绝访问（WinError 5）",
+                       blocked_process="WPS PDF (29396)")
+    rows = report.blocked_rows(outcome)
+    assert rows == [[report.KIND_BLOCKED, r"C:\wwwwwww",
+                     "拒绝访问（WinError 5）", "WPS PDF (29396)"]]
+    assert rows[0] in report.unfinished_rows(outcome)
+
+
+def test_no_blocked_step_means_no_row():
+    assert report.blocked_rows(_outcome()) == []
+
+
+def test_restore_csv_matches_the_restore_screen():
+    """恢复态下导出的是恢复信息，不是那份已经被撤销的迁移报告。
+
+    界面上写「恢复成功 / 恢复结果」，导出却给一份「迁移报告」——拿到文件的人
+    会以为迁移还在生效。缺失、未复制这些迁移期的词在恢复报告里也不该出现。
+    """
+    from dmig.core.migrator import RestoreOutcome
+    outcome = RestoreOutcome(
+        ok=True, source=r"C:\wwwwww", source_restored=True,
+        backup_path=r"C:\wwwwww.bak_20261011", target=r"D:\myapp\1",
+        target_state="cleared", acl_note="1 个目录的原始权限没能还原")
+
+    rows = report.build_restore_rows(outcome)
+    text = "\n".join(",".join(row) for row in rows)
+
+    assert report.KIND_RESTORED in text
+    assert r"C:\wwwwww" in text and "已恢复" in text
+    assert r"C:\wwwwww.bak_20261011" in text and "改回原名" in text
+    assert r"D:\myapp\1" in text and "已清空" in text
+    assert "没能还原" in text
+    assert report.KIND_MISSING not in text and report.KIND_COPY_FAILED not in text
+
+
+def test_restore_csv_carries_the_skip_reason():
+    """目标端没清成的原因必须进导出——那正是拿到报告的人要追的东西。"""
+    from dmig.core.migrator import RestoreOutcome
+    outcome = RestoreOutcome(ok=True, source=r"C:\a", source_restored=True,
+                             target=r"D:\b", target_state="skipped",
+                             target_note="目标端有 2 项不属于这次迁移的内容")
+    text = "\n".join(",".join(row) for row in report.build_restore_rows(outcome))
+    assert "不属于这次迁移" in text
+
+
+def test_csv_includes_a_blocked_step():
+    """界面看得到的「未完成步骤」，导出的 CSV 里也要有。
+
+    CSV 是完整存档（界面为防刷屏只显示前若干条），漏掉它会让导出的报告
+    看不出这一趟到底卡在哪一步——而那往往正是整趟失败的唯一原因。
+    """
+    outcome = _outcome(ok=False, phase="rename_failed",
+                       blocked_path=r"C:\wwwwwww",
+                       blocked_reason="拒绝访问（WinError 5）",
+                       blocked_process="WPS PDF (12208)")
+    rows = report.build_rows(outcome)
+    assert any(report.KIND_BLOCKED in str(row) for row in rows), \
+        f"CSV 里没有未完成步骤：{rows}"
+
+
+def test_blocked_row_without_a_path_still_shows_up():
+    """查不出具体路径时也要有条目，否则又回到「红标题配空表」。"""
+    rows = report.blocked_rows(_outcome(blocked_reason="需要管理员权限"))
+    assert rows[0][1] == "整个源目录"
+    assert rows[0][2] == "需要管理员权限"
+
+
 def test_summarize_counts_everything():
     stats = report.summarize(_outcome())
     assert stats == {"copied_files": 2, "copied_bytes": 1003, "skipped": 1,
