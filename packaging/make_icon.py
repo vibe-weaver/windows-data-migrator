@@ -1,46 +1,33 @@
-"""生成应用图标：Qt 负责画，标准库 struct 负责组装 ICO 容器。"""
+"""生成应用图标：几何取自 `dmig.ui.logo`，标准库负责组装 ICO 容器。
+
+几何**不在这里重画**——exe 图标与界面品牌栏必须取自同一张主图
+（`src/dmig/assets/logo.png`），两处各画一遍迟早走样。主图的来源与
+「白边是怎么来的」见 `src/dmig/assets/README.md`。
+"""
 from __future__ import annotations
 
 import struct
 import sys
 from pathlib import Path
 
-SIZES = (16, 32, 48, 256)
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
 
-BACKDROP = "#1F6FEB"
-FOREGROUND = "#FFFFFF"
+from dmig.ui import logo  # noqa: E402  （必须先补 sys.path）
 
 
 def render_png(size: int) -> bytes:
-    """画一个圆角底 + 双向箭头，返回 PNG 字节。"""
-    from PySide6.QtCore import QBuffer, QByteArray, QPointF, QRectF, Qt
-    from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPolygonF
+    """把品牌标记渲染成指定尺寸的 PNG 字节。"""
+    from PySide6.QtCore import QBuffer, QByteArray, Qt
+    from PySide6.QtGui import QImage, QPainter
 
     image = QImage(size, size, QImage.Format.Format_ARGB32)
     image.fill(Qt.GlobalColor.transparent)
 
     painter = QPainter(image)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-    radius = size * 0.22
-    backdrop = QPainterPath()
-    backdrop.addRoundedRect(QRectF(0, 0, size, size), radius, radius)
-    painter.fillPath(backdrop, QColor(BACKDROP))
-
-    painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor(FOREGROUND))
-    bar = max(2.0, size * 0.11)
-    head = size * 0.16
-    for ratio, direction in ((0.34, 1), (0.66, -1)):
-        center_y = size * ratio
-        left, right = size * 0.24, size * 0.76
-        painter.drawRect(QRectF(left, center_y - bar / 2, right - left, bar))
-        tip = right if direction > 0 else left
-        painter.drawPolygon(QPolygonF([
-            QPointF(tip + head * 0.5 * direction, center_y),
-            QPointF(tip - head * 0.5 * direction, center_y - head * 0.5),
-            QPointF(tip - head * 0.5 * direction, center_y + head * 0.5),
-        ]))
+    logo.draw_mark(painter, size)
     painter.end()
 
     # QByteArray 必须绑定到变量：若写成 QBuffer(QByteArray()) 这个临时对象会立即析构，
@@ -74,11 +61,12 @@ def main(out_path) -> int:
     if QGuiApplication.instance() is None:
         QGuiApplication([sys.argv[0] if sys.argv else "make_icon"])
 
-    pngs = {size: render_png(size) for size in SIZES}
+    pngs = {size: render_png(size) for size in logo.SIZES}
     target = Path(out_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(build_ico(pngs))
-    print(f"图标已生成：{target}")
+    print(f"图标已生成：{target}（{len(pngs)} 档："
+          f"{'、'.join(str(s) for s in sorted(pngs))}）")
     return 0
 
 
