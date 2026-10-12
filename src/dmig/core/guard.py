@@ -5,12 +5,18 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import locks
 from .fsutil import (DRIVE_TYPE_TEXT, UNSTABLE_DRIVE_TYPES, drive_of, is_inside,
-                     reparse_kind, supports_reparse_points, volume_filesystem,
-                     volume_free_bytes, volume_info, volume_root)
+                     long_path, reparse_kind, supports_reparse_points,
+                     volume_filesystem, volume_free_bytes, volume_info,
+                     volume_root)
 
 SPACE_MARGIN = 1.05
 SPACE_ALLOWANCE = 512 * 1024 * 1024
+
+# 试探用的临时名后缀。固定值（而不是随机）是为了万一进程死在两次改名之间，
+# 下次启动能认出这是自己留下的，而不是用户改的名字。
+PROBE_SUFFIX = ".dmig-probe"
 
 
 @dataclass(frozen=True)
@@ -131,3 +137,106 @@ def check(source, target, required_bytes: int = 0, link_count: int = 0) -> list[
             f"目标盘剩余 {free / 2**20:.0f} MB，需要约 {need / 2**20:.0f} MB"))
 
     return issues
+
+
+def probe_rename(source) -> list[Issue]:
+    """试探「把源目录改名再改回」，判断迁移最后那步会不会失败。
+
+    为什么值得单列一步：**改名失败的门槛比复制失败低得多**——任何句柄都会让它
+    失败，连只读打开都算（实测：只读打开的文件会让父目录的改名报 WinError 5）。
+    所以复制、校验全都能过，却卡在最后一步，而那时用户已经等了几个小时。
+    试探一次只需几毫秒，且**与文件数无关**（实测 5000 个文件 3.80 ms）。
+
+    **有副作用，界面上必须说明**：
+      · 源路径会消失几毫秒——正开着它的编辑器、文件监视器可能报「文件夹已删除」
+      · 父目录的修改时间会变（改名计入父目录）
+
+    返回 error 级 Issue（红色、拦住下一步）。试探通过返回空列表。
+    """
+    src = Path(source)
+    if not src.is_dir():
+        return []
+    probe = src.with_name(src.name + PROBE_SUFFIX)
+    try:
+        os.rename(long_path(src), long_path(probe))
+    except OSError as exc:
+        return [_blocked_issue(src, exc)]
+    try:
+        os.rename(long_path(probe), long_path(src))
+    except OSError as exc:
+        # 改得过去、改不回来：比单纯被占用严重得多，源目录现在挂在临时名下，
+        # 必须让用户立刻知道它去哪了。
+        return [Issue(
+            "rename_probe_stuck",
+            f"源目录改不回来了：它现在叫 {probe}，请手动改回 {src}"
+            f"（{getattr(exc, 'strerror', None) or exc}）")]
+    return []
+
+
+def probe_entries(source, names=None, on_progress=None, should_cancel=None) -> list[str]:
+    """试探源目录的顶层条目，返回**改名失败**的那些（条目名）。
+
+    用来把「整棵树里有人占着」缩小到「就这几棵子树」：改名一次约 0.67 毫秒，
+    几十个顶层条目就是几十毫秒；而拿 RestartManager 全树扫一遍要按文件数算。
+
+    `names` 限定只试探哪些条目；不传则全试。**调用方应当只传子目录**，因为：
+
+      试探一个条目   0.67 毫秒
+      让 RM 扫一个文件 0.13 毫秒
+
+    差值 5 倍——**试探普通文件永远是净亏**：没被占用时省下的 RM 工作量还不到
+    试探成本的三分之一，被占用时照样得交给 RM。只有当条目是目录、其子树里可能
+    有许多文件时，试探才可能赚回来。
+
+    副作用与 `probe_rename` 同源（父目录 mtime 会变、条目会一闪），而且这里是
+    逐项来，所以界面必须先把这件事告诉用户，不能偷偷做。
+
+    改名成功但**改不回来**的也计入返回清单：那种现场比被占用严重得多（条目挂在
+    `.dmig-probe` 名下），调用方要能察觉。实际几乎不会发生——真有句柄的话第一次
+    改名就失败了。
+    """
+    src = Path(source)
+    if not src.is_dir():
+        return []
+    if names is not None:
+        entries = [src / name for name in sorted(names)]
+    else:
+        try:
+            entries = sorted(src.iterdir(), key=lambda p: p.name)
+        except OSError:
+            return []
+    blocked: list[str] = []
+    total = len(entries)
+    for index, entry in enumerate(entries):
+        if should_cancel is not None and should_cancel():
+            break
+        probe = entry.with_name(entry.name + PROBE_SUFFIX)
+        try:
+            os.rename(long_path(entry), long_path(probe))
+        except OSError:
+            blocked.append(entry.name)
+        else:
+            try:
+                os.rename(long_path(probe), long_path(entry))
+            except OSError:
+                blocked.append(entry.name)
+        if on_progress is not None:
+            on_progress(index + 1, total)
+    return blocked
+
+
+def _blocked_issue(src: Path, exc: OSError) -> Issue:
+    """把改名失败写成人话，并尽量说清「该关掉谁」。"""
+    code = getattr(exc, "winerror", None)
+    why = {5: "拒绝访问", 32: "文件正被其他程序使用",
+           33: "文件的一部分被锁定"}.get(code)
+    head = (f"源目录无法改名：{why}（WinError {code}）" if why
+            else f"源目录无法改名：{getattr(exc, 'strerror', None) or exc}")
+    held = locks.describe(locks.blockers_in_tree(src))
+    if held:
+        return Issue("rename_blocked",
+                     f"{head}。正在占用源目录的进程：{held}。"
+                     f"关掉它们之后重新检验；确认无占用再开始迁移。")
+    return Issue("rename_blocked",
+                 f"{head}，但没查出占用进程（可能是权限不足，或某个进程正把源目录"
+                 f"当作工作目录）。请关掉可能占用它的程序后重新检验。")
