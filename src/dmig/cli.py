@@ -316,6 +316,7 @@ def main(argv: list[str] | None = None) -> int:
         # 不接管会话，rollback() 里那句 phase="rolled_back" 就写不回文件
         migrator.adopt_session(sess)
         if migrator.rollback():
+            print("已回滚到迁移前的状态；源目录已恢复为真实目录")
             return 0
         # 拒绝/失败的原因必须打印出来。回滚会被拒的最常见情形是备份已被删除，
         # 此时只说「退出码 1」用户完全不知道发生了什么、也不知道原路径还安不安全。
