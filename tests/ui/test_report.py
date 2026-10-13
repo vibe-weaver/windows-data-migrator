@@ -207,7 +207,7 @@ def test_outcome_without_links_is_tolerated():
 # --- C9：复制保不住的属性与目录时间戳 ---------------------------------
 
 def test_lossy_attributes_are_disclosed_in_one_row():
-    """稀疏/硬链接/ADS 都不会让复制报错，结果却与原件不同，报告必须写出来。"""
+    """稀疏/硬链接会改变结果；ADS 会保留——三种都写出来，说法不能反。"""
     rows = report.attribute_rows(
         _outcome(sparse_files=2, hardlinked_files=5, ads_files=12))
     assert len(rows) == 1
@@ -215,6 +215,9 @@ def test_lossy_attributes_are_disclosed_in_one_row():
     assert "2 个稀疏文件会被实化" in rows[0][2]
     assert "5 个硬链接会变成各自独立的副本" in rows[0][2]
     assert "12 个文件带附加数据流" in rows[0][2]
+    # P3 回归：这条原先反着说，与内核整文件复制会把 ADS 带过去的事实不符
+    assert "复制后会一并保留" in rows[0][2]
+    assert "附加数据流（ADS），复制后不保留" not in rows[0][2]
 
 
 def test_no_lossy_attributes_means_no_row():

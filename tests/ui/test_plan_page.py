@@ -83,13 +83,20 @@ def test_dangling_line_is_absent_when_nothing_is_broken(page):
 
 
 def test_warning_discloses_lossy_attributes(page):
-    """稀疏实化、硬链接拆开、ADS 不保留：复制不会报错，结果却与原件不同。"""
+    """稀疏实化、硬链接拆开会改变结果；ADS 则会一并保留——不能反着说。
+
+    P3 回归：这里原先写「ADS 不保留」，与 copy_one 走内核 CopyFileW 快路径的
+    事实相反（copier 自己的注释就写着会连 ADS 一起带过去，另有
+    test_kernel_copy_preserves_alternate_data_streams 逐字节钉着）。
+    """
     page.load(_plan(sparse_files=2, hardlinked_files=482, ads_files=7))
     text = page.warning_text()
     assert "复制方式的固有限制" in text
     assert "2 个稀疏文件会被实化" in text
     assert "482 个硬链接会变成各自独立的副本" in text
     assert "7 个文件带附加数据流" in text
+    assert "复制后会一并保留" in text
+    assert "附加数据流（ADS），复制后不保留" not in text
 
 
 def test_lossy_line_is_absent_when_nothing_is_lost(page):

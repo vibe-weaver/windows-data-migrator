@@ -108,10 +108,15 @@ class MigrationPlan:
 
 
 def lossy_attribute_text(sparse: int, hardlinks: int, ads: int) -> str:
-    """把三类保不住的属性说成一句话；都没有时返回空串。
+    """把三类属性披露说成一句话；都没有时返回空串。
 
     计划页（事前预告）、命令行与报告（事后留档）共用同一份措辞，
     否则同一个事实在三处会有三种说法。
+
+    注意 ADS 那条**不是「丢失」**：换内核 CopyFileW 原语之后，备用数据流会
+    随整文件复制一并带过去（实测逐字节一致，且有 test_kernel_copy_preserves_
+    alternate_data_streams 钉着）。留在这里只是因为它仍是个值得告诉用户的
+    事实——某些安全软件会读 Zone.Identifier 做隔离判断，迁移后这条信息还在。
     """
     parts: list[str] = []
     if sparse:
@@ -119,7 +124,7 @@ def lossy_attribute_text(sparse: int, hardlinks: int, ads: int) -> str:
     if hardlinks:
         parts.append(f"{hardlinks} 个硬链接会变成各自独立的副本（不再共享同一份数据）")
     if ads:
-        parts.append(f"{ads} 个文件带附加数据流（ADS），复制后不保留")
+        parts.append(f"{ads} 个文件带附加数据流（ADS），复制后会一并保留")
     return "；".join(parts)
 
 
