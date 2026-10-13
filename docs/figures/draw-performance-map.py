@@ -163,7 +163,7 @@ p.setPen(QColor(140, 20, 30))
 p.drawText(QPointF(lx(260000), ly(0.24)), "文件数主导区")
 p.setFont(QFont(F, 13))
 p.setPen(QColor(120, 30, 40))
-p.drawText(QPointF(lx(105000), ly(0.115)), "等时线竖直：换更快的盘几乎没用")
+p.drawText(QPointF(lx(105000), ly(0.115)), "等时线竖直：瓶颈不在带宽")
 p.setFont(QFont(F, 19, QFont.Weight.Bold))
 p.setPen(QColor(20, 80, 140))
 p.drawText(QPointF(lx(112), ly(5000)), "体积主导区")
@@ -229,7 +229,7 @@ p.setFont(QFont(F, 13))
 p.setPen(QColor(110, 110, 120))
 p.drawText(QPointF(30, 1044),
            "实测条件：C/D/E 为同一块 NVMe 的几个分区（读写共享通道），耗时含校验。"
-           "体积主导区换第二块物理盘会更快；文件数主导区换盘基本无收益。")
+           "体积主导区换第二块物理盘会更快；文件数主导区在同类盘之间换盘无收益（机械盘换 SSD 会大幅见效）。")
 p.drawText(QPointF(30, 1070),
            "数据来源：8 万个 128 字节文件、5000 个 1 MB 文件、160 个 256 MB 文件三组实测。"
            "小数据量装得进内存缓存时会比本图更快，图上是保守估计。")
