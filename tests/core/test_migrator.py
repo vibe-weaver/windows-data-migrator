@@ -3,6 +3,7 @@ import subprocess
 import sys
 import stat as stat_mod
 import time
+from pathlib import Path
 
 import pytest
 
@@ -370,6 +371,34 @@ def test_execute_refuses_on_permission_issues(tmp_path):
     assert out.ok is False
     assert out.phase == "permission_denied"
     assert not (tmp_path / "dst").exists()
+
+
+def test_a_refused_run_still_leaves_a_log(tmp_path):
+    """前置校验拒绝时也要留一份可交的现场。
+
+    这三处（guard / 无权限 / 缺特权）都在会话建立之前 return，原来 runlog 一直
+    是 None、outcome.log_path 是空串——用户被拒之后手里什么都没有。
+    同时**不能为此建会话**：「前置校验失败时磁盘零改动」是实测确认过的性质。
+    """
+    src, ext = _tree(tmp_path)
+    sessions = tmp_path / "sessions"
+    m = Migrator(src, tmp_path / "dst", session_root=sessions)
+    m.plan_it()
+    m.plan.permission_issues.append(str(src / "denied"))
+
+    out = m.execute()
+
+    assert out.ok is False
+    assert out.log_path, "拒绝路径应当留下日志路径"
+    log = Path(out.log_path)
+    assert log.exists()
+    assert log.name.endswith("-refused.log")
+    body = log.read_text(encoding="utf-8")
+    assert "参数" in body, "日志里要有这一趟的参数，否则没法复盘"
+    assert out.phase in body
+    # 零改动的性质不能被破坏：只多了一条日志，没有 .json / .done
+    assert list(sessions.glob("*.json")) == []
+    assert list(sessions.glob("*.done")) == []
 
 
 def test_cleanup_backup_does_not_follow_junctions(tmp_path):

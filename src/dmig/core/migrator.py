@@ -17,7 +17,7 @@ from .fsutil import (is_inside, is_link_kind, long_path, rel_to, reparse_kind,
                      strip_long_prefix)
 from .models import CopyResult, MigrationPlan, VerifyResult
 from .runlog import LOG_SUFFIX, RunLog
-from .session import Session
+from .session import Session, default_root
 
 # 改名要独占整棵树，而冲突（资源管理器开着子目录、杀软在扫）往往是瞬时的，
 # 所以退避重试；仍失败才去查是谁占用。
@@ -290,11 +290,30 @@ class Migrator:
         self.log_sink = None
 
     # --- 日志 -------------------------------------------------------
-    def _ensure_runlog(self) -> None:
-        """会话一旦就位，就把日志挂到它旁边（`<id>.log`，与 `.json`/`.done` 同前缀）。"""
-        if self.session is not None and self.runlog is None:
+    def _ensure_runlog(self, outcome=None) -> None:
+        """会话一旦就位，就把日志挂到它旁边（`<id>.log`，与 `.json`/`.done` 同前缀）。
+
+        `outcome` 只在 `execute()` 的唯一出口传进来，用来补上**拒绝路径没有日志**
+        这个缺口：guard / 无权限 / 缺特权三处都在 `_execute` 里提前 return，
+        那时会话还没建，于是 runlog 一直是 None、`outcome.log_path` 是空串，
+        用户被拒之后手里没有任何可交的现场。
+
+        这里**刻意不建会话**——「前置校验失败时磁盘零改动」是实测确认过的性质，
+        不该为了留档破坏它。改为在会话根下单独留一条 `<时间戳>-refused.log`：
+        不产生 `.json`/`.done`，文件名带 refused，与正常日志一眼可分。
+        """
+        if self.runlog is not None:
+            return
+        if self.session is not None:
             self.runlog = RunLog(self.session.path.with_suffix(LOG_SUFFIX),
                                  on_line=self._emit_log)
+            return
+        if outcome is None or outcome.ok:
+            return
+        root = Path(self.session_root) if self.session_root else default_root()
+        stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
+        self.runlog = RunLog(root / f"{stamp}-refused{LOG_SUFFIX}",
+                             on_line=self._emit_log)
 
     def _emit_log(self, line: str) -> None:
         """把一行日志转给界面。界面侧出问题绝不能影响迁移本身。
@@ -550,7 +569,12 @@ class Migrator:
                                 should_cancel=should_cancel,
                                 should_pause=should_pause)
         # 日志同样挂在唯一出口上；这一趟才新建的会话要到这时候才能挂。
-        self._ensure_runlog()
+        # 前置校验就拒绝的那几处没有会话，_ensure_runlog 会为此另开一条拒绝日志。
+        self._ensure_runlog(outcome)
+        if self.session is None and self.runlog is not None:
+            # 拒绝路径没有别的地方写参数与扫描结论：正常路径是在复制开始前写的，
+            # 而这几处连复制都没进。不写的话日志里只剩一句结论，没法复盘。
+            self._log_start()
         self._log_outcome(outcome)
         # 链接清单与属性计数都挂在唯一出口上：_execute 有十来个返回点，逐个补必然漏。
         if self.session is not None:
