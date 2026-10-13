@@ -84,6 +84,30 @@ def test_done_log_is_an_append_only_sidecar(tmp_path):
     assert "f0.bin" not in json.dumps(s.to_dict())
 
 
+def test_done_sidecar_flushes_finer_than_the_json(tmp_path):
+    """`.done` 的落盘阈值必须比 JSON 重写细，否则小树中断后等于全量重来。
+
+    原来两个阈值绑在一起（500 文件 / 5 秒），小于 500 文件的树在整个复制期间
+    一次都不落盘——实测 480 个文件被杀在复制中：copied=480 skipped=0。
+    这里断言：复制到第 FLUSH_DONE_EVERY 个文件时 .done 已经落盘，
+    而会话 JSON 的 done 计数还是 0（说明走的是只追加那条便宜路径、
+    没有触发整体重写）。
+    """
+    s = Session.create(r"D:\src", r"E:\dst", root=tmp_path)
+    n = session_mod.FLUSH_DONE_EVERY
+    assert n < session_mod.FLUSH_EVERY_FILES, "细阈值必须真的更细才有意义"
+
+    for i in range(n):
+        s.mark_done(f"f{i}.bin", 1)
+
+    lines = s.done_log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == n, f"到第 {n} 个文件时 .done 应当已落盘，实际 {len(lines)} 行"
+    # JSON 没被重写：只有 create() 那次留下的全零计数
+    assert json.loads(s.path.read_text(encoding="utf-8"))["done"]["files"] == 0
+    # 中断后重开也能读到这份记账
+    assert Session.load(s.path).completed_rels() == {f"f{i}.bin" for i in range(n)}
+
+
 def test_completed_rels_tolerates_missing_sidecar(tmp_path):
     s = Session.create(r"D:\src", r"E:\dst", root=tmp_path)
     s.done_log.unlink(missing_ok=True)

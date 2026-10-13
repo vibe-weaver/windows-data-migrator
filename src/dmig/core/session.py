@@ -15,6 +15,14 @@ from pathlib import Path
 
 FLUSH_EVERY_FILES = 500
 FLUSH_EVERY_SECONDS = 5.0
+# `.done` 追加单独一个更细的阈值，**与上面那个粗阈值解耦**。
+# 两者成本差着量级：追加 .done 是一次 open/append（几十微秒），而 save() 还要把
+# 整个会话 JSON 重写一遍（链接清单可能有几万条）。原来只按 500 文件 / 5 秒落盘，
+# 于是小于 500 文件的树在整个复制期间一次都没落过盘——中断后 resume 把整棵树
+# 重拷一遍（结果正确，白花时间）。实测 480 个文件被杀在复制中：
+# copied=480 skipped=0。这里按 32 个文件触发一次**只追加**的 flush，
+# 相对 776 微秒/文件的复制成本约 0.1%，换来中断后基本不用重拷。
+FLUSH_DONE_EVERY = 32
 DONE_SUFFIX = ".done"
 
 
@@ -106,7 +114,8 @@ class Session:
         self._pending.append(rel)
         if self.done["files"] % FLUSH_EVERY_FILES == 0:
             self.save()                       # save() 会连带落盘已完成清单
-        elif time.monotonic() - self._last_flush >= FLUSH_EVERY_SECONDS:
+        elif (len(self._pending) >= FLUSH_DONE_EVERY
+              or time.monotonic() - self._last_flush >= FLUSH_EVERY_SECONDS):
             self.flush_done()                 # 大文件很久才复制完一个，按时间兜底
 
     def flush_done(self) -> None:
