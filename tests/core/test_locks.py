@@ -386,8 +386,15 @@ def test_shutdown_reports_when_there_is_nothing_to_register():
 def test_shutdown_actually_closes_a_plain_holder(tmp_path, spawn_holder):
     """真调一次 RmShutdown——只对自建的替身进程。
 
-    实测优雅关闭对**无窗口的控制台进程**同样有效（它收到控制台关闭事件后退出），
-    所以不必一上来就用 TerminateProcess 硬杀。
+    这台机器上优雅关闭对**无窗口的控制台进程**不一定生效：RmShutdown 走的是
+    窗口消息通道，没有窗口的进程收不到，返回 351（部分成功）且进程不退出。
+    所以这里不把「优雅关闭必然让替身退出」当断言——那是环境相关的，换台机器
+    就可能翻。
+
+    要盯的两件事是：
+      1. 优雅关闭确实**发起过**（started=True），且没把替身误判成受保护进程
+         （替身不在黑名单，护栏不该拦它——拦了说明黑名单误伤面太宽）；
+      2. force=True 必然真关掉替身（这一步走 TerminateProcess，与窗口无关）。
     """
     path = tmp_path / "x.txt"
     path.write_text("x", encoding="utf-8")
@@ -395,10 +402,21 @@ def test_shutdown_actually_closes_a_plain_holder(tmp_path, spawn_holder):
 
     result = locks.shutdown_holders([path])
 
-    assert result.ok is True, result.message
-    assert result.started is True
-    deadline = time.time() + 10
+    assert result.started is True, "替身不在黑名单，优雅关闭应当发起过"
+    if result.ok:
+        # 这台机器上优雅关闭够用——替身已退出
+        deadline = time.time() + 10
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.2)
+        assert proc.poll() is not None, "优雅关闭报成功，替身却没退出"
+        return
+
+    # 优雅关闭没成（351 之类）：force_may_help 必须为真，且 force 真能关掉
+    assert result.force_may_help is True, "优雅没成，应当允许 force 再试"
+    force_result = locks.shutdown_holders([path], force=True)
+    assert force_result.ok is True, force_result.message
+    deadline = time.time() + 15
     while time.time() < deadline and proc.poll() is None:
         time.sleep(0.2)
-    assert proc.poll() is not None, "优雅关闭没有让替身退出"
+    assert proc.poll() is not None, "强制结束也没让替身退出"
 
