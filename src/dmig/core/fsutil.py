@@ -117,14 +117,19 @@ def rel_to(path, root) -> str:
 def is_excluded(path, excludes) -> bool:
     r"""该路径是否落在任一排除项之下（含相等）。
 
-    扫描、复制、校验三条遍历共用这一套判定。先剥 \\?\ 前缀是必须的：
-    `os.scandir` 给出的 entry.path 带着长路径前缀，而排除项来自用户输入，
-    不剥前缀会让 `is_inside` 的按分量比较全部落空，排除形同虚设。
+    扫描、复制、校验三条遍历共用这一套判定。**两侧都要剥 \\?\ 前缀**：
+    `os.scandir` 给出的 entry.path 带着长路径前缀；而排除项可能是界面从
+    permission_issues 里固化的值——那里面存的是扫描器见过的带前缀形式。
+    只剥候选路径、不剥排除项，按分量比较会全部落空，排除形同虚设；
+    实测界面勾了「跳过无权限目录」再迁移，permission_denied 照样发生，
+    用户被界面自己的补救办法骗了。命令行手打裸路径不受影响，所以这个
+    bug 只在界面路径上现形。
     """
     if not excludes:
         return False
     text = strip_long_prefix(str(path))
-    return any(is_inside(text, item) for item in excludes)
+    return any(is_inside(text, strip_long_prefix(str(item)))
+               for item in excludes)
 
 
 def drive_of(path) -> str:

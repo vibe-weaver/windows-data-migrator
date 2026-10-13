@@ -66,6 +66,30 @@ def test_is_inside_is_case_insensitive():
 
 def test_rel_to_strips_long_prefix_on_both_sides():
     assert fsutil.rel_to("\\\\?\\C:\\a\\b\\c.txt", "\\\\?\\C:\\a\\b") == "c.txt"
+
+
+def test_is_excluded_matches_when_the_exclude_carries_a_long_prefix(tmp_path):
+    """P2 回归：排除项带 `\\?\` 前缀时也必须匹配。
+
+    界面「跳过无权限目录」勾选框固化的排除项来自 plan.permission_issues，
+    扫描器见过的都是带前缀形式。原来 is_excluded 只剥候选路径、不剥排除项，
+    按分量比较全部落空——勾了等于没勾，迁移照样 permission_denied。
+    """
+    denied = tmp_path / "src" / "denied"
+    denied.mkdir(parents=True)
+    prefixed = "\\\\?\\" + str(denied)
+
+    assert fsutil.is_excluded(denied, [prefixed]) is True
+    assert fsutil.is_excluded(denied / "child", [prefixed]) is True
+    assert fsutil.is_excluded(tmp_path / "src" / "ok", [prefixed]) is False
+
+
+def test_is_excluded_matches_when_both_sides_carry_a_long_prefix(tmp_path):
+    """两侧都带前缀也要匹配（扫描器 scandir 给出的 entry.path 就带前缀）。"""
+    denied = tmp_path / "src" / "denied"
+    denied.mkdir(parents=True)
+    prefixed = "\\\\?\\" + str(denied)
+    assert fsutil.is_excluded(prefixed, [prefixed]) is True
     assert fsutil.rel_to(r"C:\a\b\c.txt", r"C:\a") == r"b\c.txt"
 
 
@@ -262,7 +286,11 @@ def test_is_hardlinked(tmp_path):
 
 @pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows")
 def test_has_alternate_streams_detects_a_zone_identifier(tmp_path):
-    """下载文件的 Zone.Identifier 是最常见的 ADS，复制时不会被带上。"""
+    """下载文件的 Zone.Identifier 是最常见的 ADS。
+
+    探测只回答「有没有」；复制时内核整文件复制会把它一并带过去，
+    所以这里不涉及「会不会保留」——那条由 test_copier 里的逐字节比对负责。
+    """
     if not fsutil.supports_reparse_points(str(tmp_path)):
         pytest.skip("当前卷不支持 ADS")
     plain = tmp_path / "downloaded.zip"

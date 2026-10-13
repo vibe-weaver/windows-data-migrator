@@ -52,7 +52,9 @@ def scan(source, target, mappings: dict[str, str] | None = None,
         try:
             it = os.scandir(long_path(current))
         except PermissionError:
-            plan.permission_issues.append(current)
+            # 存裸路径：这份清单会流进用户可见文本（计划页列表、报错示例、
+            # 勾选框固化的排除项），带 \\?\ 前缀的形式不该被用户看到。
+            plan.permission_issues.append(strip_long_prefix(current))
             plan.needs_elevation = True
             continue
         except OSError:
