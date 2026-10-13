@@ -1073,6 +1073,34 @@ def test_excludes_are_written_to_the_session(tmp_path):
     assert Session.load(m.session.path).options["excludes"] == [str(locked)]
 
 
+def test_options_are_on_disk_before_copying_starts(tmp_path, monkeypatch):
+    """P1 回归：复制开始之前，运行参数必须已经落盘。
+
+    原来要等复制失败或全部成功才 save()，进程在复制中途被杀时盘上还是
+    options={}——续传读回来 mappings/excludes/deep_verify 全没了。
+    用户明确排除的目录被重新扫回复制、SHA256 静默降级，最后照样报成功。
+    这里模拟「杀在复制刚开始」：让 copier.run 一进门就抛 SystemExit，
+    然后从磁盘 reload 会话，检查 options 是否完整。
+    """
+    src, ext = _tree(tmp_path)
+    moved = tmp_path / "moved"
+
+    def kill_mid_copy(*a, **kw):
+        raise SystemExit("模拟进程被杀")
+
+    monkeypatch.setattr(migrator_mod, "copy_run", kill_mid_copy)
+
+    m = Migrator(src, tmp_path / "dst", mappings={str(ext): str(moved)},
+                 deep_verify=True, session_root=tmp_path / "sessions")
+    with pytest.raises(SystemExit):
+        m.execute()
+
+    reloaded = Session.load(m.session.path)
+    assert reloaded.options["mappings"] == {str(ext): str(moved)}
+    assert reloaded.options["deep_verify"] is True
+    assert reloaded.totals["files"] > 0
+
+
 def test_nothing_excluded_leaves_cleanup_unblocked(tmp_path):
     """没有排除项时，删备份不该被这条新规则平白拦下。"""
     src, ext = _tree(tmp_path)

@@ -452,6 +452,10 @@ class Migrator:
         if self.session is None:
             self.session = Session.create(self.source, self.target,
                                           root=self.session_root)
+        # 同 P1：接管属主的 ACL 备份必须当场落盘。这中间的 backup_acl() /
+        # take_ownership() 都可能耗时或失败，杀在这段窗口里而没 save 过的话，
+        # 已记下的原始 ACL 只存在于内存里——回滚时就没有东西可还原了。
+        self.session.save()
         recorded = {item.get("path") for item in self.session.acl_backup}
         taken = 0
         failed: list[str] = []
@@ -600,6 +604,12 @@ class Migrator:
         self.session.totals = {"files": self.plan.totals.files,
                                "bytes": self.plan.totals.bytes}
         self.session.options = self.run_options()
+        # 本轮修复 P1：参数必须在复制开始前落盘。原来要等复制失败或全部成功才
+        # save()，进程在复制中途被杀时，盘上的 options 还是 create() 时的空 dict
+        # ——续传读回来 mappings/excludes/deep_verify 全没了，用户明确排除的目录
+        # 被重新扫回复制，SHA256 静默降级成只比元数据，最后照样报「迁移完成」。
+        # 这次写盘 2ms，换的是「杀在任意时刻，盘上参数都是完整的」。
+        self.session.save()
         self._ensure_runlog()
         self._log_start()
 
