@@ -33,6 +33,26 @@
 
 详细用法见压缩包里的 **`使用说明书.html`**（双击用浏览器打开）。
 
+> ### ⚠️ 装了 Windows Defender 的，先看这条
+>
+> **现在下载解压后，Defender 会把 `Windows数据迁移助手.exe` 直接删掉。** 这是**误报**：
+> 检测名 `Trojan:Win32/Bearfoos.B!ml`，`!ml` 后缀表示这是**机器学习启发式判定**，
+> 不是特征码命中。触发它的很可能是本工具的行为画像（遍历目录树、给目录改名、
+> 建 junction、关闭占用进程）——而这些操作每一步都可见、有日志、可回退。
+>
+> 已经提交微软误报申诉（2026-10-14），等白名单生效期间可以这样绕过：
+>
+> ```powershell
+> # 管理员 PowerShell：解压前先排除目标文件夹，否则解压出来立刻被删
+> Add-MpPreference -ExclusionPath 'D:\你解压到的目录'
+> ```
+>
+> 或者解压后从 **Windows 安全中心 → 病毒和威胁防护 → 保护历史记录** 里把它还原，
+> 再添加排除项。白名单通过后建议删掉排除项：
+> `Remove-MpPreference -ExclusionPath 'D:\你解压到的目录'`
+>
+> 想先核对程序到底做了什么，源码就在仓库里；也可以用 `packaging/build.ps1` 自行构建。
+
 ## 它和「剪切粘贴」「手动 mklink」的区别
 
 | 做法 | 问题 |
@@ -299,9 +319,31 @@ python app.py discard %LOCALAPPDATA%\DataMigrationTool\sessions\<id>.json --yes
 <details>
 <summary><b>杀毒软件报毒怎么办？</b></summary>
 
-PyInstaller 打包、无数字签名的 exe，加上「遍历全盘 + 改名目录 + 建链接 + 关闭进程」
-这类行为，**很可能被误报**。源码就在仓库里，可以核对该程序实际做了什么；
-也可以用 `packaging/build.ps1` 自行构建。遇到具体误报欢迎开 issue 附上引擎名称与截图。
+**已确认会误报，而且是最麻烦的一种：Windows Defender（系统自带）会直接删掉 exe。**
+
+```
+检测名   Trojan:Win32/Bearfoos.B!ml        严重度 5
+判定方式 机器学习启发式（!ml 后缀），不是特征码命中
+后果     解压出来的 exe 被隔离，双击时报「找不到文件」
+```
+
+原因是这个组合触发了启发式：**PyInstaller 打包 + 无数字签名 + 遍历目录树 / 改名目录 /
+建 junction / 关闭进程**的行为画像。已提交微软误报申诉（2026-10-14，等白名单）。
+
+**绕过办法**（解压前就做，否则文件落地即被删）：
+
+```powershell
+# 管理员 PowerShell
+Add-MpPreference -ExclusionPath 'D:\你解压到的目录'
+```
+
+解压后才发现被删的，去 **Windows 安全中心 → 病毒和威胁防护 → 保护历史记录** 还原，
+再添加排除项。白名单通过后用 `Remove-MpPreference -ExclusionPath '...'` 删掉它。
+
+**这个工具不会碰你选定的目录以外的任何东西** ✗ —— 不读注册表、不联网、不收集信息；
+关闭进程走系统官方的 RestartManager，且拒绝关闭系统关键进程、桌面外壳、安全软件和它自己。
+源码就在仓库里，可以直接核对；也可以用 `packaging/build.ps1` 自行构建（自行构建的副本
+哈希不同，同样可能被误报 ✗ 但至少你知道它是什么）。
 </details>
 
 <details>
