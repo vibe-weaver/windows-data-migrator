@@ -112,6 +112,38 @@
 
 <p>解压压缩包，双击里面的 <code>Windows数据迁移助手.exe</code>。不需要安装，也不需要管理员权限。</p>
 
+<div class="warn">
+<strong>解压后 exe 不见了，或者双击后窗口几秒就消失？那是杀毒软件误报，不是程序坏了。</strong>
+<br><br>
+检测名是 <code>Trojan:Win32/Bearfoos.B!ml</code>。带 <code>!ml</code> 后缀表示这是
+<strong>机器学习启发式判定</strong>，不是命中了已知病毒特征。这个工具的行为画像
+（遍历目录树、给目录改名、建 junction、关闭占用进程）容易触发它，而这些操作每一步
+都可见、有日志、可回退。已提交微软误报申诉，等结果期间请按下面处理。
+<br><br>
+<strong>按你装的杀软选一条：</strong>
+<ul>
+  <li><strong>Windows Defender</strong>（系统自带）：管理员 PowerShell 里执行下面两条命令，
+      或走界面「安全中心 → 病毒和威胁防护 → 管理设置 → 排除项」。</li>
+  <li><strong>电脑管家 / 360 / 火绒</strong>等第三方：到<strong>那个软件自己的</strong>
+      「信任区 / 白名单」里把解压目录加进去。下面的命令只对 Defender 生效，对它们无效。</li>
+</ul>
+
+<pre><code># 管理员 PowerShell。两条都要加——只排除文件夹管不住「运行时被拦杀」
+Add-MpPreference -ExclusionPath    'D:\你解压到的目录'
+Add-MpPreference -ExclusionProcess 'Windows数据迁移助手.exe'</code></pre>
+
+<strong>顺序很关键：先加排除、再解压</strong>，否则文件一落地就被删。
+<br><br>
+还有一道<strong>独立的</strong>门槛：从网上下载的 zip 解出来的文件带「来自互联网」标记，
+它自己也会拦一次（与误报无关）。解压后执行：
+<pre><code>Get-ChildItem 'D:\你解压到的目录' -Recurse | Unblock-File</code></pre>
+已经被删掉的，去「安全中心 → 病毒和威胁防护 → 保护历史记录」展开那条点<strong>还原</strong>，
+再补上排除项。白名单通过后建议把两条排除都撤掉（<code>Remove-MpPreference</code>，参数同上）。
+<br><br>
+想先核对程序到底做了什么：源码就在仓库里；也可以用 <code>packaging/build.ps1</code> 自行构建
+（自行构建的副本哈希不同，同样可能被误报，但至少你知道它是什么）。
+</div>
+
 <table>
   <tr><th>什么时候需要管理员</th><th>说明</th></tr>
   <tr>
