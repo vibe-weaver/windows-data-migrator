@@ -1,8 +1,12 @@
 import time
 
+import pytest
+
 from dmig.core.models import CopyResult, PlanTotals, Progress, VerifyResult
 from dmig.core.migrator import MigrateOutcome
-from dmig.ui.workers import MigrateWorker, PlanWorker, VerifyWorker
+from dmig.ui import workers as workers_mod
+from dmig.ui.workers import (MigrateWorker, PlanWorker, SelectCheckWorker,
+                             VerifyWorker)
 
 
 class _FakeMigrator:
@@ -244,3 +248,65 @@ def test_verify_worker_forwards_progress_and_options(qtbot, monkeypatch, tmp_pat
     # excludes 必须转发：重新校验不跳过被排除的目录，会报一堆假的「缺失」
     assert forwarded == {"deep": True, "totals": totals, "skip": True,
                          "excludes": ["D:\\locked"]}
+
+
+# --- 「开始检验」worker -------------------------------------------------
+
+def test_select_check_worker_runs_guard_then_probe(qtbot, monkeypatch, tmp_path):
+    """两步都跑，并且顺序是「先前置校验、后试探改名」。"""
+    order = []
+    monkeypatch.setattr(workers_mod.guard, "check",
+                        lambda s, t: order.append("check") or [])
+    monkeypatch.setattr(workers_mod.guard, "probe_rename",
+                        lambda s: order.append("probe") or [])
+
+    worker = SelectCheckWorker(tmp_path / "src", tmp_path / "dst")
+    seen = []
+    worker.done.connect(lambda issues, s, t: seen.append((issues, s, t)))
+    with qtbot.waitSignal(worker.done, timeout=5000):
+        worker.start()
+    worker.wait(5000)
+
+    assert order == ["check", "probe"]
+    assert seen[0][0] == []
+    # 回传它当时用的路径：检验期间用户可能改了路径，调用方据此判断结论是否过期
+    assert seen[0][1] == str(tmp_path / "src")
+    assert seen[0][2] == str(tmp_path / "dst")
+
+
+def test_select_check_worker_never_probes_when_the_guard_already_failed(
+        qtbot, monkeypatch, tmp_path):
+    """**安全性质**：前置校验已经报错时，绝不能去试探改名。
+
+    试探改名会真的给源目录改名再改回。系统目录（Program Files 之类）就是靠
+    这条免于被试探——`_protected_source` 报 error，`has_error` 为真，
+    于是 probe_rename 一次都不被调用。
+    """
+    called = []
+    monkeypatch.setattr(workers_mod.guard, "check", lambda s, t: [
+        workers_mod.guard.Issue("source_is_system_dir", "拒绝迁移系统目录本身")])
+    monkeypatch.setattr(workers_mod.guard, "probe_rename",
+                        lambda s: called.append(s) or [])
+
+    worker = SelectCheckWorker(r"C:\Program Files (x86)", tmp_path / "dst")
+    seen = []
+    worker.done.connect(lambda issues, s, t: seen.append(issues))
+    with qtbot.waitSignal(worker.done, timeout=5000):
+        worker.start()
+    worker.wait(5000)
+
+    assert called == [], "前置校验已报错，仍然去改名了源目录"
+    assert [i.code for i in seen[0]] == ["source_is_system_dir"]
+
+
+def test_select_check_worker_reports_failure(qtbot, monkeypatch, tmp_path):
+    """线程里炸了要变成 failed 信号——不能把异常漏给 Qt。"""
+    def boom(s, t):
+        raise RuntimeError("校验炸了")
+
+    monkeypatch.setattr(workers_mod.guard, "check", boom)
+    worker = SelectCheckWorker(tmp_path / "src", tmp_path / "dst")
+    with qtbot.waitSignal(worker.failed, timeout=5000) as blocker:
+        worker.start()
+    worker.wait(5000)
+    assert "校验炸了" in blocker.args[0]

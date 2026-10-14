@@ -1,4 +1,5 @@
 import sys
+import time
 
 import pytest
 from PySide6.QtGui import QCloseEvent
@@ -692,7 +693,7 @@ def test_session_stopped_after_the_rename_can_still_finish(qtbot, tmp_path, monk
     assert window.next_button.text() == LINK_ONLY_BUTTON
     # 检验会报「源目录不存在」（它确实已被改名），但这条路必须照样走得通：
     # 用户只差最后一步，卡在这里就只能去命令行或手工建链接。
-    window.select_page.check_button.click()
+    _run_check(window, qtbot)
     assert window.select_page.has_blocking_error() is True
     assert window.next_button.isEnabled() is True, "只差建链接时不该被检验拦住"
 
@@ -861,11 +862,112 @@ def test_select_check_blocks_the_next_step_on_a_rename_probe_failure(
     _select(window, tmp_path)
     assert window.next_button.isEnabled() is False, "没检验过就不该放行"
 
-    window.select_page.check_button.click()          # 真点按钮
+    _run_check(window, qtbot)          # 真点按钮
 
     assert "rename_blocked" in {i.code for i in window.select_page.issues()}
     assert window.next_button.isEnabled() is False, "红色错误必须按住下一步"
     assert "未通过" in window.status_line.text()
+
+
+def _run_check(window, qtbot, timeout=10000):
+    """点「开始检验」并等 worker 把结论回填。
+
+    检验是异步的（试探改名与文件数线性相关，0.46 微秒/文件，放主线程会冻界面），
+    所以点完必须等 `is_busy()` 落下来——`_on_check_done` 在 `finished` 之前发出，
+    等到不忙时结论已经渲染好了。
+    """
+    window.select_page.check_button.click()
+    qtbot.waitUntil(lambda: not window.is_busy(), timeout=timeout)
+
+
+def test_check_with_incomplete_paths_does_not_claim_success(qtbot, tmp_path):
+    """路径不全时点「开始检验」，绝不能显示绿字「前置校验通过」。
+
+    空问题列表会走进 `_render_issues` 的绿字分支——而这里根本还没得检验，
+    说「通过」是假话。这也是把检验拆成「进忙碌态 / 回填」之后我自己引入过的
+    回归：`apply_check([])` 当时对这个分支是错的。
+    """
+    (tmp_path / "src").mkdir()
+    window = MainWindow(migrator_factory=_factory(
+        _plan(), MigrateOutcome(True, "done"), []))
+    qtbot.addWidget(window)
+    window.select_page.set_source(str(tmp_path / "src"))     # 目标留空
+
+    _run_check(window, qtbot)
+
+    text = window.select_page.issues_text()
+    assert "请选择" in text
+    assert "通过" not in text, f"路径不全都说通过了：{text!r}"
+    assert window.select_page.is_checked() is False
+    assert window.select_page.has_blocking_error() is False
+    # 忙碌态必须已经退出，否则「开始检验」永远灰着
+    assert window.select_page.check_button.text() == "开始检验"
+    assert window.select_page.check_button.isEnabled() is True
+    assert window.next_button.isEnabled() is False
+
+
+def test_select_check_runs_off_the_main_thread(qtbot, tmp_path, monkeypatch):
+    """**检验必须跑在 worker 里，界面只进忙碌态。**
+
+    这条是钉「异步」本身的：试探改名与文件数线性相关（实测 0.46 微秒/文件，
+    十万文件 47 ms），慢盘或杀软过滤驱动下到秒级；跑在主线程就是窗口无响应，
+    用户看到的就是「点了没反应」。所以把 guard.check 拖慢，点下去之后
+    `is_busy()` 必须立刻为真、按钮显示「正在检验…」——同步实现下这两条都不成立。
+    """
+    from dmig.core import guard
+
+    (tmp_path / "src").mkdir()
+    window = MainWindow(migrator_factory=_factory(
+        _plan(), MigrateOutcome(True, "done"), []))
+    qtbot.addWidget(window)
+    _select(window, tmp_path)
+
+    def slow_check(source, target):
+        time.sleep(0.4)
+        return []
+
+    monkeypatch.setattr(guard, "check", slow_check)
+    monkeypatch.setattr(guard, "probe_rename", lambda source: [])
+
+    window.select_page.check_button.click()
+
+    assert window.is_busy() is True, "检验期间界面必须是忙碌态，不能同步跑完"
+    assert window.select_page.check_button.text() == "正在检验…"
+    assert window.select_page.check_button.isEnabled() is False
+
+    qtbot.waitUntil(lambda: not window.is_busy(), timeout=5000)
+
+    assert window.select_page.check_button.text() == "开始检验"
+    assert window.select_page.has_blocking_error() is False
+    assert "检验通过" in window.status_line.text()
+
+
+def test_a_system_directory_is_refused_before_any_rename(qtbot, tmp_path,
+                                                         monkeypatch):
+    """系统目录要被红线拦住，而且**一次试探都不做**。
+
+    用户实测：选 C:\\Program Files (x86) 点「开始检验」，界面冻死——根因是
+    试探改名会真的把这个系统目录改名再改回，提权进程里会牵动 WOW64 重定向、
+    AppCompat 与杀软过滤驱动重新评估整棵子树。
+    """
+    from dmig.core import guard
+
+    called = []
+    monkeypatch.setattr(guard, "probe_rename",
+                        lambda source: called.append(source) or [])
+
+    window = MainWindow(migrator_factory=_factory(
+        _plan(), MigrateOutcome(True, "done"), []))
+    qtbot.addWidget(window)
+    window.select_page.set_source(r"C:\Program Files (x86)")
+    window.select_page.set_target(str(tmp_path / "dst"))
+
+    _run_check(window, qtbot)
+
+    assert called == [], "系统目录不该被试探改名"
+    assert "source_is_system_dir" in {i.code for i in window.select_page.issues()}
+    assert window.select_page.has_blocking_error() is True
+    assert window.next_button.isEnabled() is False
 
 
 def test_select_check_lets_a_warning_through(qtbot, tmp_path, monkeypatch):
@@ -876,7 +978,7 @@ def test_select_check_lets_a_warning_through(qtbot, tmp_path, monkeypatch):
     qtbot.addWidget(window)
     _select(window, tmp_path)                        # 源与目标同盘 -> 一条 warning
 
-    window.select_page.check_button.click()
+    _run_check(window, qtbot)
 
     assert window.select_page.has_blocking_error() is False
     assert window.next_button.isEnabled() is True
@@ -899,7 +1001,7 @@ def test_select_check_does_not_probe_when_the_pre_checks_already_fail(
     qtbot.addWidget(window)
     _select(window, tmp_path)                        # 源目录不存在 -> error
 
-    window.select_page.check_button.click()
+    _run_check(window, qtbot)
 
     assert called == []
     assert window.select_page.has_blocking_error() is True
@@ -1040,12 +1142,12 @@ def test_holders_entry_only_appears_for_a_rename_failure(qtbot, tmp_path,
     qtbot.addWidget(window)
     _select(window, tmp_path)
 
-    window.select_page.check_button.click()          # 只有一个同卷警告
+    _run_check(window, qtbot)          # 只有一个同卷警告
     assert window.select_page.holders_button.isHidden() is True
 
     monkeypatch.setattr(guard, "probe_rename", lambda source: [
         guard.Issue("rename_blocked", "源目录无法改名：拒绝访问", severity="error")])
-    window.select_page.check_button.click()
+    _run_check(window, qtbot)
     assert window.select_page.holders_button.isVisibleTo(
         window.select_page) is True
 

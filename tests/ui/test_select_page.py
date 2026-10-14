@@ -168,17 +168,20 @@ def test_unchecked_state_says_so_instead_of_showing_a_pass(page, tmp_path):
 
 
 def test_editing_after_a_check_invalidates_it(page, tmp_path, monkeypatch):
-    """检验过之后改了路径，那份结论就作废——它说的是另一条路径。"""
+    """检验过之后改了路径，那份结论就作废——它说的是另一条路径。
+
+    检验现在是「进忙碌态 → worker 跑 → 回填」三段，页面自己不再跑重活
+    （试探改名与文件数线性相关，放主线程会冻界面）。
+    """
     src = tmp_path / "a"
     src.mkdir()
     other = tmp_path / "b"
     other.mkdir()
-    monkeypatch.setattr(select_page.guard, "check", lambda *a, **kw: [])
-    monkeypatch.setattr(select_page.guard, "probe_rename", lambda s: [])
 
     page.set_source(str(src))
     page.set_target(str(tmp_path / "dst"))
-    page.run_probe()
+    page.begin_check()
+    page.apply_check([])                     # 空问题列表 = 检验通过
     assert page.is_checked() is True
 
     page.set_source(str(other))
@@ -197,27 +200,28 @@ def test_check_button_asks_the_window_to_run_the_check(page):
     assert seen == [1]
 
 
-def test_run_probe_adds_a_blocking_error_when_rename_would_fail(page, tmp_path,
-                                                                monkeypatch):
-    """试探失败要变成**红色错误**，并且拦住下一步。
+def test_begin_check_disables_the_button_and_locks_the_paths(page, tmp_path):
+    """检验期间按钮要说明自己在忙、路径框要锁住。
 
-    改名失败的门槛比复制失败低得多（任何句柄都算，连只读打开都是），
-    而它发生在整趟迁移的最后一步——所以要在第一步就拦住。
+    试探改名动的是**当前**这些路径，中途被改掉，回来的结论就张冠李戴了。
     """
     src = tmp_path / "a"
     src.mkdir()
-    monkeypatch.setattr(select_page.guard, "check", lambda *a, **kw: [])
-    monkeypatch.setattr(select_page.guard, "probe_rename", lambda s: [
-        select_page.guard.Issue("rename_blocked", "源目录无法改名：拒绝访问",
-                                severity="error")])
-
     page.set_source(str(src))
     page.set_target(str(tmp_path / "b"))
-    page.run_probe()
 
-    assert page.has_blocking_error() is True
-    assert "rename_blocked" in {i.code for i in page.issues()}
-    assert "无法改名" in page.issues_text()
+    page.begin_check()
+
+    assert page.check_button.text() == "正在检验…"
+    assert page.check_button.isEnabled() is False
+    assert page.source_edit.isReadOnly() is True
+    assert page.target_edit.isReadOnly() is True
+
+    page.apply_check([])
+
+    assert page.check_button.text() == "开始检验"
+    assert page.check_button.isEnabled() is True
+    assert page.source_edit.isReadOnly() is False
 
 
 def test_probe_does_not_run_on_the_automatic_refresh(page, tmp_path, monkeypatch):

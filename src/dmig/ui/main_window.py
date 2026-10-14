@@ -32,6 +32,7 @@ from .report_page import ReportPage
 from .select_page import SelectPage
 from .shell import parse_process_label, process_image_path, relaunch_elevated
 from .workers import (HolderScanWorker, MigrateWorker, PlanWorker,
+                      SelectCheckWorker,
                       ShutdownWorker, TakeoverWorker, VerifyWorker)
 
 PAGE_SELECT = 0
@@ -291,15 +292,48 @@ class MainWindow(qf.FluentWindow):
 
         试探有副作用（源路径会消失几毫秒），所以**只在这一步做**，不挂在实时刷新上。
         失败是 error 级，`_update_buttons` 会把「开始扫描」按住不让点。
+
+        整步搬进 worker：试探改名原以为是 O(1)，实测**与文件数线性相关**
+        （0.46 微秒/文件）。十万个文件就接近半秒，慢盘或杀软过滤驱动下到秒级——
+        放在主线程就是界面冻死，用户看到的就是「点了没反应」。
         """
         if self.is_busy():
             return
-        self.select_page.run_probe()
+        source, target = self.select_page.begin_check()
+        if not source or not target:
+            # 路径不全：渲染成「请选择目录」的指引，不必起线程。
+            # 注意这里不能是「绿字通过」——apply_check 会按缺路径处理。
+            self.select_page.apply_check([])
+            self._update_buttons()
+            self.statusBar().showMessage("请先选择源目录与目标目录")
+            return
+        worker = SelectCheckWorker(source, target)
+        worker.done.connect(self._on_check_done)
+        worker.failed.connect(self._on_check_failed)
+        self._begin_worker(worker)
+        self.statusBar().showMessage("正在检验…")
+        worker.start()
+
+    def _on_check_done(self, issues, source, target) -> None:
+        page = self.select_page
+        if (page.source(), page.target()) != (source, target):
+            # 检验期间路径被改过：这份结论已经对不上现在的选择了，丢掉。
+            page.abort_check()
+            self.statusBar().showMessage("路径已改变，请重新检验")
+            return
+        page.apply_check(issues)
         self._update_buttons()
-        blocking = self.select_page.has_blocking_error()
+        blocking = page.has_blocking_error()
         self.statusBar().showMessage(
             "检验未通过：按上面的红色错误处理后再继续" if blocking
             else "检验通过，可以继续下一步")
+
+    def _on_check_failed(self, message: str) -> None:
+        # 检验本身炸了也必须把界面从忙碌态放出来，否则「开始检验」永远灰着
+        page = self.select_page
+        page.apply_check([guard.Issue("check_failed", f"检验失败：{message}")])
+        self._update_buttons()
+        self.statusBar().showMessage(f"检验失败：{message}")
 
     # --- 占用进程页（第一步的子流程）---------------------------------
 

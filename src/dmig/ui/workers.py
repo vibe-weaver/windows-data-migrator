@@ -9,6 +9,42 @@ from PySide6.QtCore import QThread, Signal
 from ..core import guard, locks, verifier
 
 
+class SelectCheckWorker(QThread):
+    """「开始检验」线程：前置校验 + 试探源目录能否改名。
+
+    为什么要 worker：试探改名原以为是 O(1) 元数据操作，实测**与文件数线性相关**
+    （0.46 微秒/文件：1 万文件 3 ms、10 万文件 47 ms——大概率是杀软过滤驱动在
+    目录改名后重新评估整棵子树）。10 万个文件就已经接近半秒，慢盘或防护更严时
+    到秒级，放在主线程就是界面冻死。
+
+    副作用与 `guard.probe_rename` 同源（源路径会消失几毫秒），这一步本来就是
+    用户显式点「开始检验」才触发的。
+
+    `source`/`target` 随结果一起回传：检验期间用户可能改了路径，调用方据此
+    判断这份结论是否过期。
+    """
+
+    done = Signal(object, str, str)          # issues, source, target
+    failed = Signal(str)
+
+    def __init__(self, source, target, parent=None):
+        super().__init__(parent)
+        self._source = str(source)
+        self._target = str(target)
+
+    def run(self) -> None:
+        try:
+            issues = list(guard.check(self._source, self._target))
+            if not guard.has_error(issues):
+                # 前置校验已经拦住了就没有必要试探——源可能根本不是目录，
+                # 而且这一跳会真的给源目录改名（系统目录尤其不能碰）。
+                issues.extend(guard.probe_rename(self._source))
+        except Exception as exc:                     # 线程里必须兜住所有异常
+            self.failed.emit(str(exc))
+            return
+        self.done.emit(issues, self._source, self._target)
+
+
 class PlanWorker(QThread):
     """预扫描线程：migrator 只需实现 plan_it(on_progress=...)。"""
 

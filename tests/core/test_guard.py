@@ -51,6 +51,61 @@ def test_source_must_not_be_drive_root():
     assert "source_is_root" in _codes(guard.check(drive, r"E:\anywhere"))
 
 
+# --- 系统目录：不许当源，且**连试探都不许做** -------------------------
+#
+# 实测来源：用户选了 C:\Program Files (x86) 当源，点「开始检验」后界面冻死。
+# 根因是 probe_rename 会真的把这个系统目录改名再改回；在提权进程里，
+# WOW64 重定向 / AppCompat / 杀软过滤驱动会同时重新评估整棵子树。
+# 这里直接测那个纯函数（不碰真实文件系统），并逐条钉住「只拦本身、不拦子目录」。
+
+@pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows")
+@pytest.mark.parametrize("path", [
+    r"C:\Windows",
+    r"C:\Windows\System32",              # SystemRoot 子树里的任何一层
+    r"C:\Windows\System32\drivers",
+    r"C:\Program Files",
+    r"C:\Program Files (x86)",
+    r"C:\ProgramData",
+    r"C:\Users",
+    r"C:\Users\Someone",                 # 用户配置文件根
+    r"D:\Program Files",                 # 别的卷上同样拦
+])
+def test_system_directories_are_refused_as_source(path):
+    issue = guard._protected_source(Path(path))
+    assert issue is not None, f"{path} 应当被拦下"
+    assert issue.severity == "error"
+    assert issue.code in ("source_is_system_dir", "source_in_windows",
+                          "source_is_profile")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="仅 Windows")
+@pytest.mark.parametrize("path", [
+    r"C:\Program Files (x86)\SomeGame",          # 装在系统目录下的具体程序
+    r"C:\Program Files\MyApp\data",
+    r"C:\Users\Someone\AppData\Local\SomeCache",  # 本工具最正当的用法之一
+    r"C:\Users\Someone\Documents\stuff",
+    r"C:\ProgramData\SomeApp\cache",
+    r"E:\data\mine",
+])
+def test_subdirectories_of_system_dirs_are_allowed(path):
+    """只拦「系统目录本身」——它们的子目录正是这个工具要服务的对象。"""
+    assert guard._protected_source(Path(path)) is None, f"{path} 不该被拦"
+
+
+def test_protected_source_short_circuits_before_any_probe(tmp_path, monkeypatch):
+    """命中系统目录时 check() 立刻返回，调用方据此跳过试探改名。
+
+    这是那条安全性质的**契约来源**：SelectCheckWorker 只在
+    `not has_error(issues)` 时才调 probe_rename（见 test_workers.py 里的同名用例）。
+    """
+    if sys.platform != "win32":
+        pytest.skip("仅 Windows")
+    monkeypatch.setattr(guard, "volume_root", lambda p: "C:\\")
+    issues = guard.check(r"C:\Program Files (x86)", str(tmp_path / "dst"))
+    assert guard.has_error(issues)
+    assert "source_is_system_dir" in {i.code for i in issues}
+
+
 def test_fails_when_target_is_inside_its_own_drive_subpath(tmp_path):
     """目标在源子树的兄弟目录里是允许的，不应报错。"""
     src = tmp_path / "a"

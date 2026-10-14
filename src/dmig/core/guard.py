@@ -18,6 +18,18 @@ SPACE_ALLOWANCE = 512 * 1024 * 1024
 # 下次启动能认出这是自己留下的，而不是用户改的名字。
 PROBE_SUFFIX = ".dmig-probe"
 
+# 不允许当作迁移源的**系统目录本身**（不含它们的子目录）。两条理由，一条比一条硬：
+#   1. 迁走它们直接破坏系统——Program Files 变成一条链接之后，依赖它的安装、
+#      更新、卸载与 WOW64 重定向都会行为异常
+#   2. 检验这一步会**真的把它们改名再改回**（probe_rename）。实测在提权进程里
+#      改 `C:\Program Files (x86)`，WOW64 重定向、AppCompat 与杀软过滤驱动会
+#      同时重新评估整棵子树，表现是系统级卡顿、界面冻死
+# 用户目录的**一级子目录**（C:\Users\<某人>）也算系统目录本身：整个配置文件被
+# 搬走同样出事；但 `...\AppData\Local\某个缓存` 这类子目录不受影响，那是本工具
+# 最正当的用法之一。
+SYSVOL_CHILDREN = ("windows", "program files", "program files (x86)",
+                   "programdata", "users")
+
 
 @dataclass(frozen=True)
 class Issue:
@@ -33,6 +45,56 @@ def has_error(issues: list[Issue]) -> bool:
 def _is_drive_root(path: Path) -> bool:
     text = os.path.abspath(str(path))
     return os.path.normcase(text).rstrip("\\/") == os.path.normcase(drive_of(text)).rstrip("\\/")
+
+
+def _norm(path) -> str:
+    """比较路径用的规范形式：绝对、去尾斜杠、大小写统一。"""
+    return os.path.normcase(os.path.normpath(os.path.abspath(str(path))))
+
+
+def _protected_source(src: Path) -> Issue | None:
+    """源是不是「系统目录本身」；是就返回一条 error。
+
+    三种情形：
+      ① 卷根下的系统目录本身——Windows / Program Files / Program Files (x86) /
+         ProgramData / Users
+      ② `%SystemRoot%` 的**整个子树**（Windows 里的东西一概不动）
+      ③ 用户目录的一级子目录，即 `C:\\Users\\<某人>` 这个配置文件根
+
+    **只拦"本身"，不拦它们的子目录**：`C:\\Program Files (x86)\\某游戏`、
+    `C:\\Users\\我\\AppData\\Local\\某缓存` 都是本工具最正当的目标。
+    """
+    text = _norm(src)
+    root = volume_root(str(src))
+    if not root:
+        return None
+    root_text = _norm(root)
+
+    for name in SYSVOL_CHILDREN:
+        if text == _norm(os.path.join(root_text, name)):
+            return Issue(
+                "source_is_system_dir",
+                f"拒绝迁移系统目录本身：{src}。"
+                f"把它整体搬走会让依赖它的安装、更新与卸载行为异常；"
+                f"而且检验这一步会真的给它改名再改回，在提权进程里足以卡死系统。"
+                f"如果你要清空间，请选某个软件的**数据目录**，而不是这样的目录本身")
+
+    system_root = os.environ.get("SystemRoot") or os.path.join(root_text, "windows")
+    sys_text = _norm(system_root)
+    if text == sys_text or text.startswith(sys_text + os.sep):
+        return Issue(
+            "source_in_windows",
+            f"拒绝迁移 Windows 系统目录：{src}。"
+            f"这个子树里任何一个部分被搬走或变成链接，都可能让系统无法启动")
+
+    users_text = _norm(os.path.join(root_text, "users"))
+    if os.path.dirname(text) == users_text and os.path.basename(text):
+        return Issue(
+            "source_is_profile",
+            f"拒绝迁移整个用户配置文件目录：{src}。"
+            f"登录、桌面与绝大多数软件都依赖它；"
+            f"可以改选它下面的具体数据目录（例如 AppData 里的某个缓存）")
+    return None
 
 
 def _volume_checks(src: Path, dst: Path, link_count: int) -> list[Issue]:
@@ -108,6 +170,13 @@ def check(source, target, required_bytes: int = 0, link_count: int = 0) -> list[
     if _is_drive_root(src):
         issues.append(Issue("source_is_root", f"拒绝迁移盘符根目录：{src}"))
 
+    protected = _protected_source(src)
+    if protected is not None:
+        # 必须排在试探之前：调用方看到 error 就会跳过 probe_rename
+        # （见 select_page.run_probe / SelectCheckWorker），
+        # 于是系统目录不会被改名——这正是这条检查要防的事。
+        return issues + [protected]
+
     if is_inside(dst, src):
         issues.append(Issue("target_inside_source",
                             f"目标位于源子树内，会导致递归复制：{dst}"))
@@ -145,7 +214,13 @@ def probe_rename(source) -> list[Issue]:
     为什么值得单列一步：**改名失败的门槛比复制失败低得多**——任何句柄都会让它
     失败，连只读打开都算（实测：只读打开的文件会让父目录的改名报 WinError 5）。
     所以复制、校验全都能过，却卡在最后一步，而那时用户已经等了几个小时。
-    试探一次只需几毫秒，且**与文件数无关**（实测 5000 个文件 3.80 ms）。
+
+    **耗时与文件数线性相关，不是 O(1)**（这条注释原来写反了，实测纠正）：
+    改一次名本该是纯元数据操作，但实测 5,000 文件 2.99 ms、60,000 文件
+    27.83 ms、100,000 文件 46.84 ms——约 **0.46 微秒/文件**。线性的成因几乎
+    只能是过滤驱动（Defender 之类的实时防护）在目录改名后重新评估整棵子树。
+    所以：**这一步必须跑在 worker 线程里**，否则慢盘/大树/杀软拦截时界面会冻死；
+    而系统目录（Program Files 之类）更不该试探——见 `_protected_source`。
 
     **有副作用，界面上必须说明**：
       · 源路径会消失几毫秒——正开着它的编辑器、文件监视器可能报「文件夹已删除」

@@ -298,8 +298,48 @@ class SelectPage(QWidget):
         self.target_edit.setText(str(path))
         self.target_edit.setCursorPosition(0)
 
+    def begin_check(self) -> tuple[str, str]:
+        """进入「正在检验」状态，返回要检验的路径对。
+
+        真正的检验（`guard.check` + 试探改名）在 worker 里跑，所以这里只做主线程
+        该做的事：刷新剩余空间、把按钮与路径框切到忙碌态。
+
+        路径框在检验期间设为只读：试探改名动的是**当前**这些路径，中途被改掉的话
+        回来的结论就张冠李戴了（worker 也会回传它当时用的路径，双保险）。
+        """
+        self.refresh_free_space()
+        self._set_busy(True)
+        return self.source(), self.target()
+
+    def apply_check(self, issues) -> list:
+        """检验结果回填：渲染问题、记下已检验的路径对、退出忙碌态。"""
+        self._set_busy(False)
+        if not self.source() or not self.target():
+            # 路径不全不是「检验通过」，而是「还没得检验」。空问题列表会走
+            # _render_issues 的绿字分支说「前置校验通过」——那是假话。
+            self._issues = []
+            self._checked_pair = None
+            self.holders_button.hide()
+            self._set_hint(self.HINT_EMPTY)
+            self._show_guidance("请选择源目录与目标目录")
+            return self._issues
+        self._issues = list(issues)
+        self._checked_pair = (self.source(), self.target())
+        self._render_issues()
+        return self._issues
+
+    def abort_check(self) -> None:
+        """放弃这次检验（结果已过期）：只退出忙碌态，不落任何结论。"""
+        self._set_busy(False)
+
+    def _set_busy(self, busy: bool) -> None:
+        self.check_button.setEnabled(not busy)
+        self.check_button.setText("正在检验…" if busy else "开始检验")
+        for edit in (self.source_edit, self.target_edit):
+            edit.setReadOnly(busy)
+
     def refresh_check(self) -> list:
-        """跑**无副作用**的那些前置检查（试探改名在 `run_probe` 里）。
+        """跑**无副作用**的那些前置检查（试探改名在 worker 里）。
 
         这个方法不再被自动调用——校验只由「开始检验」触发。留在对外接口上，
         是因为窗口需要在检验之外单独复算一遍（例如换过目标路径之后）。
@@ -314,24 +354,6 @@ class SelectPage(QWidget):
             return self._issues
         self._issues = guard.check(self.source(), self.target())
         self._render_issues()
-        return self._issues
-
-    def run_probe(self) -> list:
-        """用户点了「开始检验」：前置校验 + 试探改名。
-
-        试探失败是 error 级（红色），会拦住下一步——因为改名是迁移的**最后一步**，
-        失败时用户已经等了几个小时，而它本可以在几毫秒内就查出来。
-        """
-        issues = self.refresh_check()
-        if not self.source() or not self.target():
-            return issues
-        if not guard.has_error(issues):
-            # 前置校验已经拦住了，再试探没有意义（源可能根本不是目录），
-            # 顺带也避免了在一个注定失败的选择上触发试探的副作用。
-            issues.extend(guard.probe_rename(self.source()))
-            self._issues = issues
-            self._render_issues()
-        self._checked_pair = (self.source(), self.target())
         return self._issues
 
     def _render_issues(self) -> None:
