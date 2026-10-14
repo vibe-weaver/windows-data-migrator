@@ -9,6 +9,20 @@
 """
 from __future__ import annotations
 
+import os
+
+# 截图倍率钉死，不跟随系统显示缩放。
+#
+# 必须在导入/创建 QApplication **之前**设好：截图的像素尺寸 = 逻辑尺寸 ×
+# devicePixelRatio，而 dpr 跟随系统缩放。不钉死的话，同一份脚本在 150% 的机器上
+# 抓出 1770x990、在 100% 的机器上抓出 1180x660——同一份说明书，清晰度和体积都
+# 不一样（实测差 220 KB）。这里用覆盖而不是 setdefault，就是为了让产物可复现。
+#
+# 1.5 是文档里按 CSS 宽度显示时的合适倍率：widget.grab() 会**按这个倍率重新渲染**，
+# 多出来的是真实细节，不是把位图放大。
+RENDER_SCALE = "1.5"
+os.environ["QT_SCALE_FACTOR"] = RENDER_SCALE
+
 import base64
 import re
 import sys
