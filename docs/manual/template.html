@@ -143,6 +143,24 @@
 <p>要搬走的那个目录。可以点「浏览…」选择，也可以<strong>直接把文件夹拖进输入框</strong>。</p>
 <p>源目录可以就是某个盘符根吗？不可以——工具会拒绝，因为没法给盘根建链接。</p>
 
+<p>下面这些<strong>系统目录本身</strong>也会被拒绝（不是 bug，是刻意的保护）：</p>
+<ul>
+  <li><code>C:\Windows</code> 以及它里面的任何一层（系统路径写进注册表的地方太多，搬走哪个都可能开不了机）</li>
+  <li><code>C:\Program Files</code> 与 <code>C:\Program Files (x86)</code></li>
+  <li><code>C:\ProgramData</code></li>
+  <li><code>C:\Users</code> 以及 <code>C:\Users\&lt;你的用户名&gt;</code> 这一层</li>
+</ul>
+
+<div class="warn">
+<strong>只拦"本身"，不拦它们的子目录</strong>——下面这些正是本工具要服务的对象，都能正常迁移：
+<code>C:\Program Files (x86)\某游戏</code>、<code>C:\Users\你\AppData\Local\某缓存</code>、
+<code>C:\ProgramData\某应用\cache</code>。
+<br><br>
+<strong>为什么要拦</strong>：一是把它们整体搬走会让依赖它们的安装、更新、卸载行为异常；
+二是「开始检验」那一步会<strong>真的给源目录改名再改回</strong>，而系统目录改名会牵动
+WOW64 重定向、兼容性数据库与安全软件的过滤驱动同时重新评估整棵子树——表现就是卡死。
+</div>
+
 <h3>4.2 目标目录</h3>
 <p>数据要搬到的地方。它会成为源目录的「新家」。</p>
 <ul>
